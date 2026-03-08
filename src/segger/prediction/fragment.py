@@ -94,6 +94,9 @@ def compute_fragment_assignments(
         valid_ids = unique_ids[valid_node_mask]
         valid_labels = labels[valid_node_mask]
         return cp.asnumpy(valid_ids), cp.asnumpy(valid_labels.astype(cp.int64))
+    else:
+        source_ids = source_ids.cpu() if hasattr(source_ids, "cpu") else source_ids
+        target_ids = target_ids.cpu() if hasattr(target_ids, "cpu") else target_ids
 
     src = np.asarray(source_ids)
     dst = np.asarray(target_ids)
@@ -255,6 +258,12 @@ def apply_fragment_mode(
     source_ids = filtered_edges.select("source").to_numpy().flatten()
     target_ids = filtered_edges.select("target").to_numpy().flatten()
     similarities = filtered_edges.select(similarity_column).to_numpy().flatten()
+
+    # Check GPU memory availability
+    if use_gpu:
+        free_mem, _ = cp.cuda.runtime.memGetInfo()
+        needed_mem = source_ids.nbytes + target_ids.nbytes + similarities.nbytes
+        use_gpu = needed_mem < free_mem * 0.5
 
     # Compute connected components
     component_labels = compute_fragment_components(

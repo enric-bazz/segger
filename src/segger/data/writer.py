@@ -7,6 +7,7 @@ import polars as pl
 import numpy as np
 import torch
 import os
+import cupy as cp
 
 from ..io.fields import TrainingTranscriptFields, TrainingBoundaryFields
 from . import ISTDataModule
@@ -490,12 +491,17 @@ class ISTSegmentationWriter(BasePredictionWriter):
         filtered_src_ids = src_ids[filtered_edge_indices]
         filtered_dst_ids = dst_ids[filtered_edge_indices]
 
+        # Check GPU memory availability
+        free_mem, _ = cp.cuda.runtime.memGetInfo()
+        needed_mem = filtered_src_ids.nbytes + filtered_dst_ids.nbytes + candidate_similarities[passing_similarity].nbytes
+        use_gpu = device.type == "cuda" if (needed_mem < free_mem * 0.5) else False
+
         # RAPIDS connected-components stays on GPU when tensors are CUDA.
         fragment_tx_ids, fragment_labels = compute_fragment_assignments(
             source_ids=filtered_src_ids,
             target_ids=filtered_dst_ids,
             min_transcripts=self.fragment_min_transcripts,
-            use_gpu=(device.type == "cuda"),
+            use_gpu=use_gpu,
         )
         if fragment_tx_ids.size == 0:
             if debug_fragment:
