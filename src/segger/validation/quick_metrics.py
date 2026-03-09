@@ -1820,7 +1820,7 @@ def compute_signal_doublet_fast(
             pl.col(z_column).std().alias("z_std"),
         )
         .filter(pl.col("n_total") >= min_transcripts_per_cell)
-        .drop_nulls(["z_std"])
+        .drop_nulls(["z_std"])  # redundant for min_transcripts_per_cell > 1    
     )
 
     if stats.height == 0:
@@ -1911,6 +1911,377 @@ def _sorted_value_knee(values: np.ndarray) -> float:
     return float(v[idx])
 
 
+def _bin_transcripts_to_pixels(
+    df: pl.DataFrame,
+    x_column: str,
+    y_column: str,
+    z_column: str,
+    grid_size: float,
+    z_lookup: pl.DataFrame,
+) -> pl.DataFrame:
+    """Step 1: Spatial binning - assign transcripts to grid pixels and add z_index from precomputed z_lookup.
+    
+    Returns:
+        binned_df: DataFrame with x_pixel, y_pixel, z_index columns added
+    """
+    mins = df.select(
+        pl.col(x_column).min().alias("min_x"),
+        pl.col(y_column).min().alias("min_y"),
+    )
+    min_x = float(mins.item(0, "min_x"))
+    min_y = float(mins.item(0, "min_y"))
+
+    pixel_exprs = [
+        (((pl.col(x_column) - min_x) / grid_size).floor().cast(pl.Int32)).alias("x_pixel"),
+        (((pl.col(y_column) - min_y) / grid_size).floor().cast(pl.Int32)).alias("y_pixel"),
+    ]
+
+    return df.with_columns(pixel_exprs).join(z_lookup, on=z_column, how="inner")
+
+
+def _compute_transcript_similarity(
+    source_binned: pl.DataFrame,
+    feature_column: str,
+    min_pixel_signal: int,
+) -> pl.DataFrame:
+    """Step 2: Compute transcript similarity for each pixel.
+    
+    Calculates a pixel-level integrity score that measures the similarity between
+    adjacent z-planes based on feature distributions.
+    
+    Returns:
+        pixel_integrity: DataFrame with x_pixel, y_pixel, integrity columns
+    """
+    # Build 3D cube of feature counts
+    cube = (
+        source_binned.group_by(["x_pixel", "y_pixel", "z_index", feature_column])
+        .agg(pl.len().alias("count"))
+        .with_columns(pl.col("count").cast(pl.Int32))
+    )
+    
+    # Compute plane statistics
+    plane_stats = (
+        cube.group_by(["x_pixel", "y_pixel", "z_index"])
+        .agg(
+            pl.sum("count").alias("n_plane"),
+            (pl.col("count") * pl.col("count")).sum().alias("norm_sq"),
+        )
+        .with_columns(
+            pl.col("n_plane").cast(pl.Float64),
+            pl.col("norm_sq").cast(pl.Float64),
+        )
+    )
+
+    # Set up adjacent plane pairs for cosine similarity computation
+    lower_planes = plane_stats.rename(
+        {"n_plane": "n_plane_lower", "norm_sq": "norm_sq_lower"}
+    )
+    upper_planes = (
+        plane_stats.rename({"n_plane": "n_plane_upper", "norm_sq": "norm_sq_upper"})
+        .with_columns((pl.col("z_index") - 1).alias("z_index"))
+    )
+    plane_pairs = lower_planes.join(
+        upper_planes,
+        on=["x_pixel", "y_pixel", "z_index"],
+        how="inner",
+    )
+
+    # Compute dot product between adjacent planes by feature
+    lower_gene = cube.rename({"count": "count_lower"})
+    upper_gene = cube.rename({"count": "count_upper"}).with_columns(
+        (pl.col("z_index") - 1).alias("z_index")
+    )
+    pair_dot = (
+        lower_gene.join(
+            upper_gene,
+            on=["x_pixel", "y_pixel", "z_index", feature_column],
+            how="inner",
+        )
+        .group_by(["x_pixel", "y_pixel", "z_index"])
+        .agg(
+            (pl.col("count_lower") * pl.col("count_upper"))
+            .sum()
+            .cast(pl.Float64)
+            .alias("dot")
+        )
+    )
+
+    # Compute cosine similarity for each plane pair
+    pair_stats = (
+        plane_pairs.join(pair_dot, on=["x_pixel", "y_pixel", "z_index"], how="left")
+        .with_columns(pl.col("dot").fill_null(0.0))
+        .with_columns(
+            (
+                pl.col("dot")
+                / (
+                    (pl.col("norm_sq_lower").sqrt() * pl.col("norm_sq_upper").sqrt())
+                    + 1e-9
+                )
+            )
+            .clip(lower_bound=0.0, upper_bound=1.0)
+            .alias("pair_cosine"),
+            (pl.col("n_plane_lower") + pl.col("n_plane_upper")).alias("pair_weight"),
+        )
+    )
+
+    # Aggregate pixel-level integrity from plane pairs
+    pixel_signal = (
+        cube.group_by(["x_pixel", "y_pixel"])
+        .agg(pl.sum("count").alias("pixel_signal"))
+        .with_columns(pl.col("pixel_signal").cast(pl.Float64))
+    )
+    pixel_integrity = (
+        pair_stats.group_by(["x_pixel", "y_pixel"])
+        .agg(
+            (pl.col("pair_cosine") * pl.col("pair_weight")).sum().alias("weighted_sum"),
+            pl.sum("pair_weight").alias("weight_sum"),
+        )
+        .join(pixel_signal, on=["x_pixel", "y_pixel"], how="inner")
+        .filter(pl.col("pixel_signal") >= float(min_pixel_signal))
+        .with_columns(
+            (
+                pl.col("weighted_sum") / (pl.col("weight_sum") + 1e-9)
+            )
+            .clip(lower_bound=0.0, upper_bound=1.0)
+            .alias("integrity")
+        )
+        .select(["x_pixel", "y_pixel", "integrity"])
+    )
+    
+    return pixel_integrity
+
+
+def _get_candidate_cells_from_hotspots(
+    assigned_binned: pl.DataFrame,
+    cell_id_column: str,
+    pixel_integrity: pl.DataFrame,
+    max_cells: int,
+    seed: int,
+) -> tuple[pl.DataFrame, float]:
+    """Step 3: Get candidate cells based on knee/elbow cutoff of pixel integrity.
+    
+    Returns:
+        cell_hotspots: DataFrame with cell_id_column and hotspot_pixel_count
+        cutoff: The integrity cutoff value used
+    """
+    cutoff = _sorted_value_knee(
+        pixel_integrity.get_column("integrity").to_numpy().astype(np.float64, copy=False)
+    )
+    
+    hotspot_pixels = (
+        pixel_integrity.filter(pl.col("integrity") <= cutoff)
+        .select(["x_pixel", "y_pixel"])
+        .unique()
+    )
+
+    cell_hotspots = (
+        assigned_binned.select([cell_id_column, "x_pixel", "y_pixel"])
+        .unique()
+        .join(hotspot_pixels, on=["x_pixel", "y_pixel"], how="inner")
+        .group_by(cell_id_column)
+        .agg(pl.len().alias("hotspot_pixel_count"))
+    )
+
+    # Optionally subsample if too many candidate cells
+    if max_cells > 0 and cell_hotspots.height > max_cells:
+        rng = np.random.default_rng(seed)
+        ids = np.array(cell_hotspots.get_column(cell_id_column).to_list(), dtype=object)
+        picked = rng.choice(ids, size=max_cells, replace=False).tolist()
+        cell_hotspots = cell_hotspots.filter(pl.col(cell_id_column).is_in(picked))
+
+    return cell_hotspots, cutoff
+
+
+def _compute_z_splits(
+    candidate_tx: pl.DataFrame,
+    cell_id_column: str,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Step 4: Compute z-axis split point where each cell is divided in half by transcript count.
+    
+    Returns:
+        split_z: DataFrame with cell_id_column and split_z columns
+        cell_z: DataFrame with z-level aggregation (used later for identifying scorable cells)
+    """
+    cell_z = (
+        candidate_tx.group_by([cell_id_column, "z_index"])
+        .agg(pl.len().alias("n_z"))
+        .sort([cell_id_column, "z_index"])
+        .with_columns(
+            pl.col("n_z").sum().over(cell_id_column).alias("n_total_tx"),
+            pl.col("n_z").cum_sum().over(cell_id_column).alias("cum_n"),
+        )
+    )
+    split_z = (
+        cell_z.filter(pl.col("cum_n") >= (pl.col("n_total_tx") / 2.0))
+        .group_by(cell_id_column)
+        .agg(pl.min("z_index").alias("split_z"))
+    )
+    return split_z, cell_z
+
+
+def _identify_scorable_cells(
+    cell_hotspots: pl.DataFrame,
+    split_z: pl.DataFrame,
+    cell_z: pl.DataFrame,
+    cell_id_column: str,
+    min_transcripts_per_cell: int,
+    min_side_transcripts: int,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Step 5: Identify cells that are scorable based on minimum transcript counts.
+    
+    Returns:
+        eligible_cells: All cells meeting minimum transcript threshold
+        scorable_cells: Subset with minimum transcripts on both sides of split
+    """
+    cell_side_counts = (
+        cell_z.join(split_z, on=cell_id_column, how="inner")
+        .group_by(cell_id_column)
+        .agg(
+            (
+                pl.when(pl.col("z_index") <= pl.col("split_z"))
+                .then(pl.col("n_z"))
+                .otherwise(0)
+            )
+            .sum()
+            .alias("n_lower"),
+            (
+                pl.when(pl.col("z_index") > pl.col("split_z"))
+                .then(pl.col("n_z"))
+                .otherwise(0)
+            )
+            .sum()
+            .alias("n_upper"),
+            pl.first("n_total_tx").alias("n_total_tx"),
+            pl.first("split_z").alias("split_z"),
+        )
+    )
+
+    eligible_cells = (
+        cell_hotspots.join(cell_side_counts, on=cell_id_column, how="inner")
+        .filter(pl.col("n_total_tx") >= min_transcripts_per_cell)
+        .with_columns(
+            pl.when(pl.col("n_lower") < pl.col("n_upper"))
+            .then(pl.col("n_lower"))
+            .otherwise(pl.col("n_upper"))
+            .alias("n_minor_side")
+        )
+    )
+    
+    scorable_cells = eligible_cells.filter(pl.col("n_minor_side") >= min_side_transcripts)
+    
+    return eligible_cells, scorable_cells
+
+
+def _score_cells_for_doublets(
+    cell_id_column: str,
+    feature_column: str,
+    eligible_cells: pl.DataFrame,
+    scorable_cells: pl.DataFrame,
+    candidate_tx: pl.DataFrame,
+    doublet_threshold: float,
+) -> dict[str, float]:
+    """Step 6: Score cells for doublets and apply threshold filter.
+    
+    Computes coherence scores for eligible cells and filters based on doublet threshold.
+    
+    Returns:
+        Dictionary with doublet fraction and confidence interval
+    """
+    # Initialize all eligible cells with coherence = 1.0
+    scores = eligible_cells.select([cell_id_column, "hotspot_pixel_count"]).with_columns(
+        pl.lit(1.0).alias("coherence")
+    )
+
+    # Compute coherence scores for scorable cells
+    if scorable_cells.height > 0:
+        candidate_gene_z = (
+            candidate_tx.group_by([cell_id_column, "z_index", feature_column])
+            .agg(pl.len().alias("count"))
+            .join(scorable_cells.select([cell_id_column, "split_z"]), on=cell_id_column, how="inner")
+            .with_columns(
+                pl.when(pl.col("z_index") <= pl.col("split_z"))
+                .then(pl.lit("lower"))
+                .otherwise(pl.lit("upper"))
+                .alias("side")
+            )
+            .group_by([cell_id_column, "side", feature_column])
+            .agg(pl.sum("count").alias("count"))
+        )
+
+        lower_side = candidate_gene_z.filter(pl.col("side") == "lower").select(
+            [cell_id_column, feature_column, pl.col("count").alias("count_lower")]
+        )
+        upper_side = candidate_gene_z.filter(pl.col("side") == "upper").select(
+            [cell_id_column, feature_column, pl.col("count").alias("count_upper")]
+        )
+        
+        # Compute dot product between lower and upper side gene distributions
+        dot = (
+            lower_side.join(
+                upper_side,
+                on=[cell_id_column, feature_column],
+                how="inner",
+            )
+            .group_by(cell_id_column)
+            .agg(
+                (pl.col("count_lower") * pl.col("count_upper"))
+                .sum()
+                .cast(pl.Float64)
+                .alias("dot")
+            )
+        )
+        
+        # Compute norms for cosine similarity
+        lower_norm = (
+            lower_side.group_by(cell_id_column)
+            .agg(((pl.col("count_lower") * pl.col("count_lower")).sum()).alias("norm_sq_lower"))
+            .with_columns(pl.col("norm_sq_lower").cast(pl.Float64))
+        )
+        upper_norm = (
+            upper_side.group_by(cell_id_column)
+            .agg(((pl.col("count_upper") * pl.col("count_upper")).sum()).alias("norm_sq_upper"))
+            .with_columns(pl.col("norm_sq_upper").cast(pl.Float64))
+        )
+        
+        # Compute cosine coherence score
+        scored = (
+            scorable_cells.select([cell_id_column])
+            .join(lower_norm, on=cell_id_column, how="inner")
+            .join(upper_norm, on=cell_id_column, how="inner")
+            .join(dot, on=cell_id_column, how="left")
+            .with_columns(pl.col("dot").fill_null(0.0))
+            .with_columns(
+                (
+                    pl.col("dot")
+                    / (
+                        (pl.col("norm_sq_lower").sqrt() * pl.col("norm_sq_upper").sqrt())
+                        + 1e-9
+                    )
+                )
+                .clip(lower_bound=0.0, upper_bound=1.0)
+                .alias("coherence")
+            )
+            .select([cell_id_column, "coherence"])
+        )
+        
+        # Merge computed scores with baseline scores
+        scores = (
+            scores.join(scored, on=cell_id_column, how="left", suffix="_new")
+            .with_columns(pl.col("coherence_new").fill_null(pl.col("coherence")).alias("coherence"))
+            .drop("coherence_new")
+        )
+
+    # Compute doublet metrics
+    weights = scores.get_column("hotspot_pixel_count").to_numpy().astype(np.float64, copy=False)
+    coherence = scores.get_column("coherence").to_numpy().astype(np.float64, copy=False)
+    flags = (coherence < doublet_threshold).astype(np.float64)
+    
+    return {
+        "doublet_fraction": float(np.average(flags, weights=weights)),
+        "doublet_fraction_ci95": float(_weighted_bernoulli_ci95(flags, weights)),
+    }
+
+
 def compute_signal_hotspot_doublet_fast(
     source_tx: pl.DataFrame,
     assigned_tx: pl.DataFrame,
@@ -1945,158 +2316,39 @@ def compute_signal_hotspot_doublet_fast(
     if source.height == 0 or assigned.height == 0:
         return result
 
-    mins = source.select(
-        pl.col(x_column).min().alias("min_x"),
-        pl.col(y_column).min().alias("min_y"),
-    )
-    min_x = float(mins.item(0, "min_x"))
-    min_y = float(mins.item(0, "min_y"))
-
+    # Step 1: Spatial binning
     z_lookup = (
-        source.select(pl.col(z_column).unique().sort())
+        source_tx.select(pl.col(z_column).unique().sort())
         .with_row_index("z_index")
         .with_columns(pl.col("z_index").cast(pl.Int32))
     )
     if z_lookup.height < 2:
         return result
 
-    pixel_exprs = [
-        (((pl.col(x_column) - min_x) / grid_size).floor().cast(pl.Int32)).alias("x_pixel"),
-        (((pl.col(y_column) - min_y) / grid_size).floor().cast(pl.Int32)).alias("y_pixel"),
-    ]
-
-    source_binned = source.with_columns(pixel_exprs).join(z_lookup, on=z_column, how="inner")
-    assigned_binned = assigned.with_columns(pixel_exprs).join(z_lookup, on=z_column, how="inner")
+    source_binned = _bin_transcripts_to_pixels(source, x_column, y_column, z_column, grid_size, z_lookup)
+    assigned_binned = _bin_transcripts_to_pixels(assigned, x_column, y_column, z_column, grid_size, z_lookup)
     if source_binned.height == 0 or assigned_binned.height == 0:
         return result
 
-    cube = (
-        source_binned.group_by(["x_pixel", "y_pixel", "z_index", feature_column])
-        .agg(pl.len().alias("count"))
-        .with_columns(pl.col("count").cast(pl.Int32))
-    )
-    if cube.height == 0:
-        return result
-
-    plane_stats = (
-        cube.group_by(["x_pixel", "y_pixel", "z_index"])
-        .agg(
-            pl.sum("count").alias("n_plane"),
-            (pl.col("count") * pl.col("count")).sum().alias("norm_sq"),
-        )
-        .with_columns(
-            pl.col("n_plane").cast(pl.Float64),
-            pl.col("norm_sq").cast(pl.Float64),
-        )
-    )
-
-    lower_planes = plane_stats.rename(
-        {"n_plane": "n_plane_lower", "norm_sq": "norm_sq_lower"}
-    )
-    upper_planes = (
-        plane_stats.rename({"n_plane": "n_plane_upper", "norm_sq": "norm_sq_upper"})
-        .with_columns((pl.col("z_index") - 1).alias("z_index"))
-    )
-    plane_pairs = lower_planes.join(
-        upper_planes,
-        on=["x_pixel", "y_pixel", "z_index"],
-        how="inner",
-    )
-    if plane_pairs.height == 0:
-        return result
-
-    lower_gene = cube.rename({"count": "count_lower"})
-    upper_gene = cube.rename({"count": "count_upper"}).with_columns(
-        (pl.col("z_index") - 1).alias("z_index")
-    )
-    pair_dot = (
-        lower_gene.join(
-            upper_gene,
-            on=["x_pixel", "y_pixel", "z_index", feature_column],
-            how="inner",
-        )
-        .group_by(["x_pixel", "y_pixel", "z_index"])
-        .agg(
-            (pl.col("count_lower") * pl.col("count_upper"))
-            .sum()
-            .cast(pl.Float64)
-            .alias("dot")
-        )
-    )
-
-    pair_stats = (
-        plane_pairs.join(pair_dot, on=["x_pixel", "y_pixel", "z_index"], how="left")
-        .with_columns(pl.col("dot").fill_null(0.0))
-        .with_columns(
-            (
-                pl.col("dot")
-                / (
-                    (pl.col("norm_sq_lower").sqrt() * pl.col("norm_sq_upper").sqrt())
-                    + 1e-9
-                )
-            )
-            .clip(lower_bound=0.0, upper_bound=1.0)
-            .alias("pair_cosine"),
-            (pl.col("n_plane_lower") + pl.col("n_plane_upper")).alias("pair_weight"),
-        )
-    )
-
-    pixel_signal = (
-        cube.group_by(["x_pixel", "y_pixel"])
-        .agg(pl.sum("count").alias("pixel_signal"))
-        .with_columns(pl.col("pixel_signal").cast(pl.Float64))
-    )
-    pixel_integrity = (
-        pair_stats.group_by(["x_pixel", "y_pixel"])
-        .agg(
-            (pl.col("pair_cosine") * pl.col("pair_weight")).sum().alias("weighted_sum"),
-            pl.sum("pair_weight").alias("weight_sum"),
-        )
-        .join(pixel_signal, on=["x_pixel", "y_pixel"], how="inner")
-        .filter(pl.col("pixel_signal") >= float(min_pixel_signal))
-        .with_columns(
-            (
-                pl.col("weighted_sum") / (pl.col("weight_sum") + 1e-9)
-            )
-            .clip(lower_bound=0.0, upper_bound=1.0)
-            .alias("integrity")
-        )
-        .select(["x_pixel", "y_pixel", "integrity"])
+    # Step 2: Compute OFR transcript similarity for each pixel
+    pixel_integrity = _compute_transcript_similarity(
+        source_binned, feature_column, min_pixel_signal
     )
     if pixel_integrity.height == 0:
         return result
 
-    cutoff = _sorted_value_knee(
-        pixel_integrity.get_column("integrity").to_numpy().astype(np.float64, copy=False)
+    # Step 3: Get candidate cells based on knee/elbow cutoff
+    cell_hotspots, cutoff = _get_candidate_cells_from_hotspots(
+        assigned_binned, cell_id_column, pixel_integrity, max_cells, seed
     )
     if not np.isfinite(cutoff):
         return result
-
-    hotspot_pixels = (
-        pixel_integrity.filter(pl.col("integrity") <= cutoff)
-        .select(["x_pixel", "y_pixel"])
-        .unique()
-    )
-    result["signal_hotspot_cutoff_fast"] = float(cutoff)
-    result["signal_hotspot_pixels_used_fast"] = int(hotspot_pixels.height)
-    if hotspot_pixels.height == 0:
-        return result
-
-    cell_hotspots = (
-        assigned_binned.select([cell_id_column, "x_pixel", "y_pixel"])
-        .unique()
-        .join(hotspot_pixels, on=["x_pixel", "y_pixel"], how="inner")
-        .group_by(cell_id_column)
-        .agg(pl.len().alias("hotspot_pixel_count"))
+    result["signal_hotspot_cutoff_fast"] = cutoff
+    result["signal_hotspot_pixels_used_fast"] = int(
+        pixel_integrity.filter(pl.col("integrity") <= cutoff).height
     )
     if cell_hotspots.height == 0:
         return result
-
-    if max_cells > 0 and cell_hotspots.height > max_cells:
-        rng = np.random.default_rng(seed)
-        ids = np.array(cell_hotspots.get_column(cell_id_column).to_list(), dtype=object)
-        picked = rng.choice(ids, size=max_cells, replace=False).tolist()
-        cell_hotspots = cell_hotspots.filter(pl.col(cell_id_column).is_in(picked))
 
     result["signal_hotspot_candidate_cells_fast"] = int(cell_hotspots.height)
 
@@ -2108,141 +2360,28 @@ def compute_signal_hotspot_doublet_fast(
     if candidate_tx.height == 0:
         return result
 
-    cell_z = (
-        candidate_tx.group_by([cell_id_column, "z_index"])
-        .agg(pl.len().alias("n_z"))
-        .sort([cell_id_column, "z_index"])
-        .with_columns(
-            pl.col("n_z").sum().over(cell_id_column).alias("n_total_tx"),
-            pl.col("n_z").cum_sum().over(cell_id_column).alias("cum_n"),
-        )
-    )
-    split_z = (
-        cell_z.filter(pl.col("cum_n") >= (pl.col("n_total_tx") / 2.0))
-        .group_by(cell_id_column)
-        .agg(pl.min("z_index").alias("split_z"))
-    )
-    cell_side_counts = (
-        cell_z.join(split_z, on=cell_id_column, how="inner")
-        .group_by(cell_id_column)
-        .agg(
-            (
-                pl.when(pl.col("z_index") <= pl.col("split_z"))
-                .then(pl.col("n_z"))
-                .otherwise(0)
-            )
-            .sum()
-            .alias("n_lower"),
-            (
-                pl.when(pl.col("z_index") > pl.col("split_z"))
-                .then(pl.col("n_z"))
-                .otherwise(0)
-            )
-            .sum()
-            .alias("n_upper"),
-            pl.first("n_total_tx").alias("n_total_tx"),
-            pl.first("split_z").alias("split_z"),
-        )
-    )
+    # Step 4: Compute z-axis splits
+    split_z, cell_z = _compute_z_splits(candidate_tx, cell_id_column)
 
-    eligible_cells = (
-        cell_hotspots.join(cell_side_counts, on=cell_id_column, how="inner")
-        .filter(pl.col("n_total_tx") >= min_transcripts_per_cell)
-        .with_columns(
-            pl.when(pl.col("n_lower") < pl.col("n_upper"))
-            .then(pl.col("n_lower"))
-            .otherwise(pl.col("n_upper"))
-            .alias("n_minor_side")
-        )
+    # Step 5: Identify scorable cells
+    eligible_cells, scorable_cells = _identify_scorable_cells(
+        cell_hotspots, split_z, cell_z, cell_id_column,
+        min_transcripts_per_cell, min_side_transcripts
     )
     result["signal_hotspot_metric_cells_used_fast"] = int(eligible_cells.height)
     if eligible_cells.height == 0:
         return result
 
-    scorable_cells = eligible_cells.filter(pl.col("n_minor_side") >= min_side_transcripts)
     result["signal_hotspot_cells_scored_fast"] = int(scorable_cells.height)
 
-    scores = eligible_cells.select([cell_id_column, "hotspot_pixel_count"]).with_columns(
-        pl.lit(1.0).alias("coherence")
+    # Step 6: Score cells and apply threshold filter
+    score_results = _score_cells_for_doublets(
+        cell_id_column, feature_column, eligible_cells, scorable_cells,
+        candidate_tx, doublet_threshold
     )
+    result["signal_hotspot_doublet_fraction_fast"] = score_results["doublet_fraction"]
+    result["signal_hotspot_doublet_fraction_ci95_fast"] = score_results["doublet_fraction_ci95"]
 
-    if scorable_cells.height > 0:
-        candidate_gene_z = (
-            candidate_tx.group_by([cell_id_column, "z_index", feature_column])
-            .agg(pl.len().alias("count"))
-            .join(scorable_cells.select([cell_id_column, "split_z"]), on=cell_id_column, how="inner")
-            .with_columns(
-                pl.when(pl.col("z_index") <= pl.col("split_z"))
-                .then(pl.lit("lower"))
-                .otherwise(pl.lit("upper"))
-                .alias("side")
-            )
-            .group_by([cell_id_column, "side", feature_column])
-            .agg(pl.sum("count").alias("count"))
-        )
-
-        lower_side = candidate_gene_z.filter(pl.col("side") == "lower").select(
-            [cell_id_column, feature_column, pl.col("count").alias("count_lower")]
-        )
-        upper_side = candidate_gene_z.filter(pl.col("side") == "upper").select(
-            [cell_id_column, feature_column, pl.col("count").alias("count_upper")]
-        )
-        dot = (
-            lower_side.join(
-                upper_side,
-                on=[cell_id_column, feature_column],
-                how="inner",
-            )
-            .group_by(cell_id_column)
-            .agg(
-                (pl.col("count_lower") * pl.col("count_upper"))
-                .sum()
-                .cast(pl.Float64)
-                .alias("dot")
-            )
-        )
-        lower_norm = (
-            lower_side.group_by(cell_id_column)
-            .agg(((pl.col("count_lower") * pl.col("count_lower")).sum()).alias("norm_sq_lower"))
-            .with_columns(pl.col("norm_sq_lower").cast(pl.Float64))
-        )
-        upper_norm = (
-            upper_side.group_by(cell_id_column)
-            .agg(((pl.col("count_upper") * pl.col("count_upper")).sum()).alias("norm_sq_upper"))
-            .with_columns(pl.col("norm_sq_upper").cast(pl.Float64))
-        )
-        scored = (
-            scorable_cells.select([cell_id_column])
-            .join(lower_norm, on=cell_id_column, how="inner")
-            .join(upper_norm, on=cell_id_column, how="inner")
-            .join(dot, on=cell_id_column, how="left")
-            .with_columns(pl.col("dot").fill_null(0.0))
-            .with_columns(
-                (
-                    pl.col("dot")
-                    / (
-                        (pl.col("norm_sq_lower").sqrt() * pl.col("norm_sq_upper").sqrt())
-                        + 1e-9
-                    )
-                )
-                .clip(lower_bound=0.0, upper_bound=1.0)
-                .alias("coherence")
-            )
-            .select([cell_id_column, "coherence"])
-        )
-        scores = (
-            scores.join(scored, on=cell_id_column, how="left", suffix="_new")
-            .with_columns(pl.col("coherence_new").fill_null(pl.col("coherence")).alias("coherence"))
-            .drop("coherence_new")
-        )
-
-    weights = scores.get_column("hotspot_pixel_count").to_numpy().astype(np.float64, copy=False)
-    coherence = scores.get_column("coherence").to_numpy().astype(np.float64, copy=False)
-    flags = (coherence < doublet_threshold).astype(np.float64)
-    result["signal_hotspot_doublet_fraction_fast"] = float(np.average(flags, weights=weights))
-    result["signal_hotspot_doublet_fraction_ci95_fast"] = float(
-        _weighted_bernoulli_ci95(flags, weights)
-    )
     return result
 
 
