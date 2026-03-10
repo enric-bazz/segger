@@ -2081,7 +2081,9 @@ def _get_candidate_cells_from_hotspots(
         .group_by(cell_id_column)
         .agg(pl.len().alias("hotspot_pixel_count"))
     )
-
+    # Sort for random sampling proper reproducibility
+    cell_hotspots = cell_hotspots.sort(cell_id_column)
+    
     # Optionally subsample if too many candidate cells
     if max_cells > 0 and cell_hotspots.height > max_cells:
         rng = np.random.default_rng(seed)
