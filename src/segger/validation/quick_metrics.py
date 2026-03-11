@@ -1910,37 +1910,8 @@ def _sorted_value_knee(values: np.ndarray) -> float:
         idx = int(np.argmax(scores))
     return float(v[idx])
 
-
-def _bin_transcripts_to_pixels(
-    df: pl.DataFrame,
-    x_column: str,
-    y_column: str,
-    z_column: str,
-    grid_size: float,
-    z_lookup: pl.DataFrame,
-) -> pl.DataFrame:
-    """Step 1: Spatial binning - assign transcripts to grid pixels and add z_index from precomputed z_lookup.
-    
-    Returns:
-        binned_df: DataFrame with x_pixel, y_pixel, z_index columns added
-    """
-    mins = df.select(
-        pl.col(x_column).min().alias("min_x"),
-        pl.col(y_column).min().alias("min_y"),
-    )
-    min_x = float(mins.item(0, "min_x"))
-    min_y = float(mins.item(0, "min_y"))
-
-    pixel_exprs = [
-        (((pl.col(x_column) - min_x) / grid_size).floor().cast(pl.Int32)).alias("x_pixel"),
-        (((pl.col(y_column) - min_y) / grid_size).floor().cast(pl.Int32)).alias("y_pixel"),
-    ]
-
-    return df.with_columns(pixel_exprs).join(z_lookup, on=z_column, how="inner")
-
-
 def _compute_transcript_similarity(
-    source_binned: pl.DataFrame,
+    cube: pl.DataFrame,
     feature_column: str,
     min_pixel_signal: int,
 ) -> pl.DataFrame:
@@ -1952,13 +1923,6 @@ def _compute_transcript_similarity(
     Returns:
         pixel_integrity: DataFrame with x_pixel, y_pixel, integrity columns
     """
-    # Build 3D cube of feature counts
-    cube = (
-        source_binned.group_by(["x_pixel", "y_pixel", "z_index", feature_column])
-        .agg(pl.len().alias("count"))
-        .with_columns(pl.col("count").cast(pl.Int32))
-    )
-    
     # Compute plane statistics
     plane_stats = (
         cube.group_by(["x_pixel", "y_pixel", "z_index"])
@@ -2055,18 +2019,15 @@ def _get_candidate_cells_from_hotspots(
     assigned_binned: pl.DataFrame,
     cell_id_column: str,
     pixel_integrity: pl.DataFrame,
+    cutoff: float,
     max_cells: int,
     seed: int,
-) -> tuple[pl.DataFrame, float]:
+) -> pl.DataFrame:
     """Step 3: Get candidate cells based on knee/elbow cutoff of pixel integrity.
     
     Returns:
         cell_hotspots: DataFrame with cell_id_column and hotspot_pixel_count
-        cutoff: The integrity cutoff value used
     """
-    cutoff = _sorted_value_knee(
-        pixel_integrity.get_column("integrity").to_numpy().astype(np.float64, copy=False)
-    )
     
     hotspot_pixels = (
         pixel_integrity.filter(pl.col("integrity") <= cutoff)
@@ -2091,7 +2052,7 @@ def _get_candidate_cells_from_hotspots(
         picked = rng.choice(ids, size=max_cells, replace=False).tolist()
         cell_hotspots = cell_hotspots.filter(pl.col(cell_id_column).is_in(picked))
 
-    return cell_hotspots, cutoff
+    return cell_hotspots
 
 
 def _compute_z_splits(
@@ -2318,40 +2279,69 @@ def compute_signal_hotspot_doublet_fast(
     if source.height == 0 or assigned.height == 0:
         return result
 
-    # Step 1: Spatial binning
+    # Spatial binning (on source coordinates)
+    mins = source.select(
+        pl.col(x_column).min().alias("min_x"),
+        pl.col(y_column).min().alias("min_y"),
+    )
+    min_x = float(mins.item(0, "min_x"))
+    min_y = float(mins.item(0, "min_y"))
+
     z_lookup = (
-        source_tx.select(pl.col(z_column).unique().sort())
+        source.select(pl.col(z_column).unique().sort())
         .with_row_index("z_index")
         .with_columns(pl.col("z_index").cast(pl.Int32))
     )
     if z_lookup.height < 2:
         return result
 
-    source_binned = _bin_transcripts_to_pixels(source, x_column, y_column, z_column, grid_size, z_lookup)
-    assigned_binned = _bin_transcripts_to_pixels(assigned, x_column, y_column, z_column, grid_size, z_lookup)
+    pixel_exprs = [
+        (((pl.col(x_column) - min_x) / grid_size).floor().cast(pl.Int32)).alias("x_pixel"),
+        (((pl.col(y_column) - min_y) / grid_size).floor().cast(pl.Int32)).alias("y_pixel"),
+    ]
+
+    source_binned = source.with_columns(pixel_exprs).join(z_lookup, on=z_column, how="inner")
+    assigned_binned = assigned.with_columns(pixel_exprs).join(z_lookup, on=z_column, how="inner")
     if source_binned.height == 0 or assigned_binned.height == 0:
         return result
 
-    # Step 2: Compute OFR transcript similarity for each pixel
+    # Compute transcript similarity for each pixel
+    cube = (
+        source_binned.group_by(["x_pixel", "y_pixel", "z_index", feature_column])
+        .agg(pl.len().alias("count"))
+        .with_columns(pl.col("count").cast(pl.Int32))
+    )
+    if cube.height == 0:
+        return result
+    
     pixel_integrity = _compute_transcript_similarity(
-        source_binned, feature_column, min_pixel_signal
+        cube, feature_column, min_pixel_signal
     )
     if pixel_integrity.height == 0:
         return result
 
-    # Step 3: Get candidate cells based on knee/elbow cutoff
-    cell_hotspots, cutoff = _get_candidate_cells_from_hotspots(
-        assigned_binned, cell_id_column, pixel_integrity, max_cells, seed
+    # Get candidate cells based on knee/elbow cutoff
+    cutoff = _sorted_value_knee(
+        pixel_integrity.get_column("integrity").to_numpy().astype(np.float64, copy=False)
     )
     if not np.isfinite(cutoff):
         return result
     result["signal_hotspot_cutoff_fast"] = cutoff
-    result["signal_hotspot_pixels_used_fast"] = int(
-        pixel_integrity.filter(pl.col("integrity") <= cutoff).height
+
+    hotspot_pixels = (
+        pixel_integrity.filter(pl.col("integrity") <= cutoff)
+        .select(["x_pixel", "y_pixel"])
+        .unique()
+    )
+    result["signal_hotspot_pixels_used_fast"] = int(hotspot_pixels.height)
+    if hotspot_pixels.height == 0:
+        return result
+
+    cell_hotspots = _get_candidate_cells_from_hotspots(
+        assigned_binned, cell_id_column, pixel_integrity, cutoff, max_cells, seed
     )
     if cell_hotspots.height == 0:
         return result
-
     result["signal_hotspot_candidate_cells_fast"] = int(cell_hotspots.height)
 
     candidate_tx = assigned_binned.join(
@@ -2362,21 +2352,21 @@ def compute_signal_hotspot_doublet_fast(
     if candidate_tx.height == 0:
         return result
 
-    # Step 4: Compute z-axis splits
+    # Compute z-axis splits
     split_z, cell_z = _compute_z_splits(candidate_tx, cell_id_column)
 
-    # Step 5: Identify scorable cells
+    # Identify scorable cells
     eligible_cells, scorable_cells = _identify_scorable_cells(
         cell_hotspots, split_z, cell_z, cell_id_column,
         min_transcripts_per_cell, min_side_transcripts
     )
-    result["signal_hotspot_metric_cells_used_fast"] = int(eligible_cells.height)
     if eligible_cells.height == 0:
         return result
-
+    
+    result["signal_hotspot_metric_cells_used_fast"] = int(eligible_cells.height)
     result["signal_hotspot_cells_scored_fast"] = int(scorable_cells.height)
 
-    # Step 6: Score cells and apply threshold filter
+    # Score cells and apply threshold filter
     score_results = _score_cells_for_doublets(
         cell_id_column, feature_column, eligible_cells, scorable_cells,
         candidate_tx, doublet_threshold
