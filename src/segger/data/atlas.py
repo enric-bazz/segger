@@ -290,13 +290,16 @@ def _normalize_tissue(tissue: str) -> str:
     Raises ``ValueError`` with fuzzy-match suggestions if the name is not
     recognized.
     """
-    key = tissue.strip().lower()
+    key = " ".join(str(tissue).strip().lower().replace("_", " ").replace("-", " ").split())
     if key in _TISSUE_ALIASES:
         return _TISSUE_ALIASES[key]
+    canonical = set(_TISSUE_ALIASES.values())
+    if key in canonical:
+        return key
 
     # Not a known alias — try fuzzy matching
     close = difflib.get_close_matches(key, _ALL_KNOWN_NAMES, n=5, cutoff=0.6)
-    valid_tissues = sorted(set(_TISSUE_ALIASES.values()))
+    valid_tissues = sorted(canonical)
 
     msg = f"Unknown tissue type: '{tissue}'."
     if close:
@@ -309,7 +312,10 @@ def _normalize_tissue(tissue: str) -> str:
 
 def _normalize_tissue_lenient(tissue: str) -> str:
     """Like ``_normalize_tissue`` but passes through unknown names instead of raising."""
-    key = tissue.strip().lower()
+    key = " ".join(str(tissue).strip().lower().replace("_", " ").replace("-", " ").split())
+    canonical = set(_TISSUE_ALIASES.values())
+    if key in canonical:
+        return key
     return _TISSUE_ALIASES.get(key, key)
 
 
@@ -547,6 +553,38 @@ def _load_metadata(meta_path: Path) -> dict:
 def _write_metadata(meta_path: Path, meta: dict) -> None:
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
+def _set_var_names_from_feature_column(
+    adata: "ad.AnnData",
+    feature_column: str = "feature_name",
+) -> bool:
+    """Promote ``adata.var[feature_column]`` into ``adata.var_names``.
+
+    Empty/NA feature values fall back to existing var_names. Returns ``True``
+    when var_names were updated.
+    """
+    if feature_column not in adata.var.columns:
+        return False
+
+    original = [str(value) for value in adata.var_names]
+    feature_values = adata.var[feature_column].astype("string").fillna("")
+
+    promoted: list[str] = []
+    for fallback, raw in zip(original, feature_values.astype(str).tolist()):
+        token = raw.strip()
+        if not token or token.lower() in {"nan", "none"}:
+            promoted.append(fallback)
+        else:
+            promoted.append(token)
+
+    changed = promoted != original
+    if changed:
+        adata.var_names = promoted
+    if not adata.var_names.is_unique:
+        adata.var_names_make_unique()
+        changed = True
+    return changed
 
 
 def _build_reference_from_metadata(meta_path: Path) -> AtlasReference:
@@ -1173,6 +1211,7 @@ def fetch_reference(
     adata.obs["cell_type"] = adata.obs["cell_type"].cat.remove_unused_categories()
     final_types = sorted(adata.obs["cell_type"].cat.categories.tolist())
     immune_only = _immune_only_guess(final_types)
+    _set_var_names_from_feature_column(adata, feature_column="feature_name")
 
     # Atomic write
     h5ad.parent.mkdir(parents=True, exist_ok=True)
@@ -1196,6 +1235,7 @@ def fetch_reference(
         "n_obs": int(adata.n_obs),
         "n_cell_types": len(final_types),
         "cell_type_column": "cell_type",
+        "var_name_column": "feature_name",
         "immune_only": immune_only,
         "cell_type_preview": final_types[:30],
         "max_cells_per_type": max_cells_per_type,

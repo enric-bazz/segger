@@ -37,8 +37,29 @@ def _clean_cell_id_expr(cell_col: str) -> pl.Expr:
 
 
 def _nucleus_overlap_expr(overlap_col: str) -> pl.Expr:
-    overlap_str = pl.col(overlap_col).cast(pl.Utf8).str.to_lowercase()
-    return overlap_str.is_in(["1", "2", "true", "t", "yes", "y", "nuclear"])
+    """Return a boolean expression for nucleus-assigned transcripts.
+
+    The source column semantics differ by platform:
+    - Xenium often provides `overlaps_nucleus` style boolean/0/1 flags.
+    - CosMX may provide compartment labels (`CellComp`).
+    - MERSCOPE often provides a nucleus boundary id column.
+    """
+    name = overlap_col.strip().lower()
+    overlap_str = pl.col(overlap_col).cast(pl.Utf8).str.strip_chars().str.to_lowercase()
+
+    # MERSCOPE-style nucleus boundary id columns: any non-null/non-zero id means nucleus.
+    if "nucleus_bound" in name or name in {"nucleus_id", "nucleus.id", "nucleus"}:
+        return (
+            pl.col(overlap_col).is_not_null()
+            & ~overlap_str.is_in(["", "0", "-1", "none", "unassigned"])
+        )
+
+    # Explicit compartment labels/encodings.
+    if name in {"cell_compartment", "cellcomp"}:
+        return overlap_str.is_in(["2", "nuclear", "nucleus"])
+
+    # Generic boolean-like overlap indicator.
+    return overlap_str.is_in(["1", "2", "true", "t", "yes", "y", "nuclear", "nucleus"])
 
 
 def _build_anndata(tx: pl.DataFrame, out_h5ad: Path) -> tuple[int, int]:
@@ -144,8 +165,24 @@ def build_reference_artifacts(
     x_col = _pick_column(schema_names, ["x_location", "x", "global_x", "x_global_px"])
     y_col = _pick_column(schema_names, ["y_location", "y", "global_y", "y_global_px"])
     z_col = _pick_column(schema_names, ["z_location", "z", "global_z"], required=False)
-    cell_col = _pick_column(schema_names, ["cell_id", "cell"])
-    overlap_col = _pick_column(schema_names, ["overlaps_nucleus", "cell_compartment", "CellComp"], required=False)
+    cell_col = _pick_column(
+        schema_names,
+        ["cell_id", "cell", "cell_boundaries_id", "cell_boundary_id", "cell.id"],
+    )
+    overlap_col = _pick_column(
+        schema_names,
+        [
+            "overlaps_nucleus",
+            "cell_compartment",
+            "CellComp",
+            "nucleus_boundaries_id",
+            "nucleus_boundary_id",
+            "nucleus_id",
+            "nucleus",
+            "nucleus.id",
+        ],
+        required=False,
+    )
 
     select_cols = ["row_index", feature_col, x_col, y_col, cell_col]
     if z_col is not None:

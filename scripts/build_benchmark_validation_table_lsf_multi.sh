@@ -13,15 +13,173 @@ Options:
   --root <dir>       Top-level LSF benchmark root
                      (default: /dkfz/cluster/gpu/checkpoints/OE0606/elihei/segger_lsf_benchmark_fixed)
   --out-tsv <file>   Output aggregate TSV path
-                     (default: <root>/summaries/aggregate_validation_metrics.tsv)
+                     (default: <root>/summaries/aggregate_validation_metrics_.tsv)
+  --exclude-fragment-jobs <bool>
+                     Skip fragment-mode jobs (name contains "fragon") in per-dataset and aggregate outputs
+                     (default: false)
+  --include-default-10x <bool>
+                     Include ref_10x_cell/ref_10x_nucleus rows in each dataset validation table
+                     (default: true)
+  --include-border-contamination <bool>
+                     Include border-contamination metric in per-dataset validation (default: false)
+  --include-positive-marker-recall <bool>
+                     Include positive-marker-recall metric in per-dataset validation (default: false)
+  --include-center-border-ncv <bool>
+                     Include center-border-ncv metric in per-dataset validation (default: false)
+  --include-resolvi <bool>
+                     Include resolvi contamination metric in per-dataset validation (default: false)
+  --include-tco <bool>
+                     Include transcript-centroid-offset metric in per-dataset validation (default: false)
+  --include-vsi <bool>
+                     Include VSI metric in per-dataset validation (default: false)
+  --progressive-write <bool>
+                     Update aggregate TSV incrementally while running (default: true)
+  --jobs <int>       Number of datasets to refresh in parallel (default: 1)
+  --recompute        Recompute validation rows for each dataset (passes --recompute to per-dataset script)
   --no-refresh       Do not run the per-dataset validation script when a table is missing
   -h, --help         Show this help
 EOF
 }
 
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
 ROOT="/dkfz/cluster/gpu/checkpoints/OE0606/elihei/segger_lsf_benchmark_fixed"
 OUT_TSV=""
 REFRESH=1
+EXCLUDE_FRAGMENT_JOBS="false"
+INCLUDE_DEFAULT_10X="true"
+INCLUDE_BORDER_CONTAMINATION="false"
+INCLUDE_POSITIVE_MARKER_RECALL="false"
+INCLUDE_CENTER_BORDER_NCV="false"
+INCLUDE_RESOLVI="false"
+INCLUDE_TCO="false"
+INCLUDE_VSI="false"
+PROGRESSIVE_WRITE="true"
+JOBS="${VALIDATION_JOBS:-1}"
+RECOMPUTE=0
+DATASET_VALIDATION_TSV_NAME="validation_metrics_.tsv"
+
+normalize_bool() {
+  local v="${1:-}"
+  local lc
+  lc="$(printf '%s' "${v}" | tr '[:upper:]' '[:lower:]')"
+  case "${lc}" in
+    1|true|t|yes|y|on)
+      printf 'true'
+      ;;
+    0|false|f|no|n|off)
+      printf 'false'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+tsv_data_rows() {
+  local tsv_path="$1"
+  if [[ ! -f "${tsv_path}" ]]; then
+    printf '%s' "-1"
+    return 0
+  fi
+  awk 'END { if (NR > 0) print NR - 1; else print 0 }' "${tsv_path}" 2>/dev/null || printf '%s' "-1"
+}
+
+refresh_dataset_validation() {
+  local dataset_dir="$1"
+  local idx="$2"
+  local total="$3"
+  local dataset validation_tsv legacy_validation_tsv context_file refresh_log rc
+  local partial_validation_tsv
+  local validation_rows legacy_rows partial_rows
+  local -a recompute_args
+
+  dataset="$(basename "${dataset_dir}")"
+  validation_tsv="${dataset_dir}/summaries/${DATASET_VALIDATION_TSV_NAME}"
+  legacy_validation_tsv="${dataset_dir}/summaries/validation_metrics.tsv"
+  partial_validation_tsv="${dataset_dir}/summaries/${DATASET_VALIDATION_TSV_NAME%.tsv}.partial.tsv"
+  context_file="${dataset_dir}/dataset_context.env"
+  refresh_log="${dataset_dir}/summaries/validation_refresh.log"
+  rc=0
+
+  if [[ "${REFRESH}" != "1" ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH skip dataset=${dataset} reason=refresh_disabled"
+    return 0
+  fi
+  validation_rows="$(tsv_data_rows "${validation_tsv}")"
+  if [[ "${RECOMPUTE}" != "1" && "${validation_rows}" -gt 0 ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH skip dataset=${dataset} reason=validation_exists"
+    return 0
+  fi
+  if [[ ! -f "${context_file}" ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH skip dataset=${dataset} reason=missing_dataset_context"
+    return 0
+  fi
+
+  echo "[$(timestamp)] [${idx}/${total}] REFRESH start dataset=${dataset}"
+  : > "${refresh_log}"
+  echo "[$(timestamp)] REFRESH dataset=${dataset} root=${dataset_dir}" >> "${refresh_log}"
+
+  unset DATASET_KEY INPUT_DIR SCRNA_REFERENCE_PATH TISSUE_TYPE SEGGER_BIN || true
+  # shellcheck disable=SC1090
+  source "${context_file}"
+
+  recompute_args=()
+  if [[ "${RECOMPUTE}" == "1" ]]; then
+    recompute_args+=(--recompute)
+  fi
+
+  if [[ -z "${SCRNA_REFERENCE_PATH:-}" ]]; then
+    echo "[$(timestamp)] ERROR dataset=${dataset} missing SCRNA_REFERENCE_PATH in ${context_file}; refusing tissue fallback." >> "${refresh_log}"
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH done dataset=${dataset} status=missing_scrna_reference"
+    return 0
+  fi
+  if [[ ! -f "${SCRNA_REFERENCE_PATH}" ]]; then
+    echo "[$(timestamp)] ERROR dataset=${dataset} configured SCRNA_REFERENCE_PATH missing; refusing tissue fallback: ${SCRNA_REFERENCE_PATH}" >> "${refresh_log}"
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH done dataset=${dataset} status=missing_scrna_reference"
+    return 0
+  fi
+
+  if bash "${SCRIPT_DIR}/build_benchmark_validation_table.sh" \
+    --root "${dataset_dir}" \
+    --out-tsv "${validation_tsv}" \
+    --input-dir "${INPUT_DIR}" \
+    --scrna-reference-path "${SCRNA_REFERENCE_PATH}" \
+    --include-default-10x "${INCLUDE_DEFAULT_10X}" \
+    --include-border-contamination "${INCLUDE_BORDER_CONTAMINATION}" \
+    --include-positive-marker-recall "${INCLUDE_POSITIVE_MARKER_RECALL}" \
+    --include-center-border-ncv "${INCLUDE_CENTER_BORDER_NCV}" \
+    --include-resolvi "${INCLUDE_RESOLVI}" \
+    --include-tco "${INCLUDE_TCO}" \
+    --include-vsi "${INCLUDE_VSI}" \
+    --exclude-fragment-jobs "${EXCLUDE_FRAGMENT_JOBS}" \
+    --progressive-write "${PROGRESSIVE_WRITE}" \
+    "${recompute_args[@]}" \
+    >> "${refresh_log}" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH warn dataset=${dataset} status=validation_script_failed rc=${rc} log=${refresh_log}"
+  fi
+
+  validation_rows="$(tsv_data_rows "${validation_tsv}")"
+  legacy_rows="$(tsv_data_rows "${legacy_validation_tsv}")"
+  partial_rows="$(tsv_data_rows "${partial_validation_tsv}")"
+  if [[ "${validation_rows}" -gt 0 ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH done dataset=${dataset}"
+  elif [[ "${legacy_rows}" -gt 0 ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH done dataset=${dataset} status=legacy_validation_tsv"
+  elif [[ "${partial_rows}" -gt 0 ]]; then
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH done dataset=${dataset} status=partial_validation_tsv"
+  else
+    echo "[$(timestamp)] [${idx}/${total}] REFRESH done dataset=${dataset} status=missing_validation_tsv"
+  fi
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,8 +191,52 @@ while [[ $# -gt 0 ]]; do
       OUT_TSV="$2"
       shift 2
       ;;
+    --exclude-fragment-jobs)
+      EXCLUDE_FRAGMENT_JOBS="$2"
+      shift 2
+      ;;
+    --include-default-10x)
+      INCLUDE_DEFAULT_10X="$2"
+      shift 2
+      ;;
+    --include-border-contamination)
+      INCLUDE_BORDER_CONTAMINATION="$2"
+      shift 2
+      ;;
+    --include-positive-marker-recall)
+      INCLUDE_POSITIVE_MARKER_RECALL="$2"
+      shift 2
+      ;;
+    --include-center-border-ncv)
+      INCLUDE_CENTER_BORDER_NCV="$2"
+      shift 2
+      ;;
+    --include-resolvi)
+      INCLUDE_RESOLVI="$2"
+      shift 2
+      ;;
+    --include-tco)
+      INCLUDE_TCO="$2"
+      shift 2
+      ;;
+    --include-vsi)
+      INCLUDE_VSI="$2"
+      shift 2
+      ;;
+    --progressive-write)
+      PROGRESSIVE_WRITE="$2"
+      shift 2
+      ;;
+    --jobs)
+      JOBS="$2"
+      shift 2
+      ;;
     --no-refresh)
       REFRESH=0
+      shift
+      ;;
+    --recompute)
+      RECOMPUTE=1
       shift
       ;;
     -h|--help)
@@ -49,60 +251,163 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! EXCLUDE_FRAGMENT_JOBS="$(normalize_bool "${EXCLUDE_FRAGMENT_JOBS}")"; then
+  echo "ERROR: --exclude-fragment-jobs must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_DEFAULT_10X="$(normalize_bool "${INCLUDE_DEFAULT_10X}")"; then
+  echo "ERROR: --include-default-10x must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_BORDER_CONTAMINATION="$(normalize_bool "${INCLUDE_BORDER_CONTAMINATION}")"; then
+  echo "ERROR: --include-border-contamination must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_POSITIVE_MARKER_RECALL="$(normalize_bool "${INCLUDE_POSITIVE_MARKER_RECALL}")"; then
+  echo "ERROR: --include-positive-marker-recall must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_CENTER_BORDER_NCV="$(normalize_bool "${INCLUDE_CENTER_BORDER_NCV}")"; then
+  echo "ERROR: --include-center-border-ncv must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_RESOLVI="$(normalize_bool "${INCLUDE_RESOLVI}")"; then
+  echo "ERROR: --include-resolvi must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_TCO="$(normalize_bool "${INCLUDE_TCO}")"; then
+  echo "ERROR: --include-tco must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_VSI="$(normalize_bool "${INCLUDE_VSI}")"; then
+  echo "ERROR: --include-vsi must be true/false." >&2
+  exit 1
+fi
+if ! PROGRESSIVE_WRITE="$(normalize_bool "${PROGRESSIVE_WRITE}")"; then
+  echo "ERROR: --progressive-write must be true/false." >&2
+  exit 1
+fi
+if ! [[ "${JOBS}" =~ ^[0-9]+$ ]] || [[ "${JOBS}" -lt 1 ]]; then
+  echo "ERROR: --jobs must be a positive integer." >&2
+  exit 1
+fi
+
 if [[ -z "${OUT_TSV}" ]]; then
-  OUT_TSV="${ROOT}/summaries/aggregate_validation_metrics.tsv"
+  OUT_TSV="${ROOT}/summaries/aggregate_validation_metrics_.tsv"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$(dirname "${OUT_TSV}")"
 
-header_written=0
+if [[ "${JOBS}" -gt 1 ]] && ! (help wait 2>/dev/null | grep -q -- '-n'); then
+  echo "[$(timestamp)] WARN wait -n not supported by this shell; forcing --jobs 1"
+  JOBS=1
+fi
+
+dataset_dirs=()
+for dataset_dir in "${ROOT}"/datasets/*; do
+  [[ -d "${dataset_dir}" ]] || continue
+  dataset_dirs+=("${dataset_dir}")
+done
+
 found_any=0
+if [[ "${#dataset_dirs[@]}" -gt 0 ]]; then
+  found_any=1
+fi
+
+if [[ "${found_any}" == "1" && "${REFRESH}" == "1" ]]; then
+  total_refresh="${#dataset_dirs[@]}"
+  running_refresh=0
+  completed_refresh=0
+  launched_refresh=0
+  echo "[$(timestamp)] REFRESH queueing datasets=${total_refresh} jobs=${JOBS}"
+
+  for dataset_dir in "${dataset_dirs[@]}"; do
+    launched_refresh=$((launched_refresh + 1))
+    if [[ "${JOBS}" -gt 1 ]]; then
+      while [[ "${running_refresh}" -ge "${JOBS}" ]]; do
+        wait -n || true
+        running_refresh=$((running_refresh - 1))
+        completed_refresh=$((completed_refresh + 1))
+        echo "[$(timestamp)] REFRESH progress ${completed_refresh}/${total_refresh}"
+      done
+      refresh_dataset_validation "${dataset_dir}" "${launched_refresh}" "${total_refresh}" &
+      running_refresh=$((running_refresh + 1))
+    else
+      refresh_dataset_validation "${dataset_dir}" "${launched_refresh}" "${total_refresh}"
+      completed_refresh=$((completed_refresh + 1))
+      echo "[$(timestamp)] REFRESH progress ${completed_refresh}/${total_refresh}"
+    fi
+  done
+
+  if [[ "${JOBS}" -gt 1 ]]; then
+    while [[ "${running_refresh}" -gt 0 ]]; do
+      wait -n || true
+      running_refresh=$((running_refresh - 1))
+      completed_refresh=$((completed_refresh + 1))
+      echo "[$(timestamp)] REFRESH progress ${completed_refresh}/${total_refresh}"
+    done
+  fi
+fi
+
+header_written=0
 tmp_out="$(mktemp)"
 trap 'rm -f "${tmp_out}"' EXIT
 : > "${tmp_out}"
+if [[ "${PROGRESSIVE_WRITE}" == "true" ]]; then
+  cp "${tmp_out}" "${OUT_TSV}"
+fi
 
-for dataset_dir in "${ROOT}"/datasets/*; do
-  [[ -d "${dataset_dir}" ]] || continue
-  found_any=1
+total_aggregate="${#dataset_dirs[@]}"
+aggregate_idx=0
+source_current_count=0
+source_legacy_count=0
+source_partial_count=0
+source_missing_count=0
+
+for dataset_dir in "${dataset_dirs[@]}"; do
+  aggregate_idx=$((aggregate_idx + 1))
   dataset="$(basename "${dataset_dir}")"
-  validation_tsv="${dataset_dir}/summaries/validation_metrics.tsv"
-  context_file="${dataset_dir}/dataset_context.env"
+  validation_tsv="${dataset_dir}/summaries/${DATASET_VALIDATION_TSV_NAME}"
+  legacy_validation_tsv="${dataset_dir}/summaries/validation_metrics.tsv"
+  partial_validation_tsv="${dataset_dir}/summaries/${DATASET_VALIDATION_TSV_NAME%.tsv}.partial.tsv"
+  source_tsv=""
+  source_label=""
+  validation_rows="$(tsv_data_rows "${validation_tsv}")"
+  legacy_rows="$(tsv_data_rows "${legacy_validation_tsv}")"
+  partial_rows="$(tsv_data_rows "${partial_validation_tsv}")"
 
-  if [[ ! -f "${validation_tsv}" && "${REFRESH}" == "1" && -f "${context_file}" ]]; then
-    unset DATASET_KEY INPUT_DIR SCRNA_REFERENCE_PATH TISSUE_TYPE SEGGER_BIN || true
-    # shellcheck disable=SC1090
-    source "${context_file}"
-    if [[ -n "${TISSUE_TYPE:-}" ]]; then
-      bash "${SCRIPT_DIR}/build_benchmark_validation_table.sh" \
-        --root "${dataset_dir}" \
-        --input-dir "${INPUT_DIR}" \
-        --tissue-type "${TISSUE_TYPE}" \
-        --include-default-10x true \
-        >/dev/null || true
-    elif [[ -n "${SCRNA_REFERENCE_PATH:-}" ]]; then
-      bash "${SCRIPT_DIR}/build_benchmark_validation_table.sh" \
-        --root "${dataset_dir}" \
-        --input-dir "${INPUT_DIR}" \
-        --scrna-reference-path "${SCRNA_REFERENCE_PATH}" \
-        --include-default-10x true \
-        >/dev/null || true
-    else
-      bash "${SCRIPT_DIR}/build_benchmark_validation_table.sh" \
-        --root "${dataset_dir}" \
-        --input-dir "${INPUT_DIR}" \
-        --include-default-10x true \
-        >/dev/null || true
-    fi
+  echo "[$(timestamp)] [${aggregate_idx}/${total_aggregate}] AGGREGATE dataset=${dataset}"
+
+  if [[ "${validation_rows}" -gt 0 ]]; then
+    source_tsv="${validation_tsv}"
+    source_label="validation_tsv"
+    source_current_count=$((source_current_count + 1))
+  elif [[ "${legacy_rows}" -gt 0 ]]; then
+    source_tsv="${legacy_validation_tsv}"
+    source_label="legacy_validation_tsv"
+    source_legacy_count=$((source_legacy_count + 1))
+    echo "[$(timestamp)] [${aggregate_idx}/${total_aggregate}] AGGREGATE dataset=${dataset} source=legacy_validation_tsv rows=${legacy_rows}"
+  elif [[ "${partial_rows}" -gt 0 ]]; then
+    source_tsv="${partial_validation_tsv}"
+    source_label="partial_validation_tsv"
+    source_partial_count=$((source_partial_count + 1))
+    echo "[$(timestamp)] [${aggregate_idx}/${total_aggregate}] AGGREGATE dataset=${dataset} source=partial_validation_tsv rows=${partial_rows}"
+  else
+    source_missing_count=$((source_missing_count + 1))
+    echo "[$(timestamp)] [${aggregate_idx}/${total_aggregate}] AGGREGATE dataset=${dataset} source=missing_validation_tsv"
+    continue
   fi
 
-  [[ -f "${validation_tsv}" ]] || continue
   if [[ "${header_written}" == "0" ]]; then
-    head -n1 "${validation_tsv}" | awk -F'\t' '{ printf "dataset"; for (i = 1; i <= NF; i++) printf "\t%s", $i; printf "\n" }' > "${tmp_out}"
+    head -n1 "${source_tsv}" | awk -F'\t' '{ printf "dataset"; for (i = 1; i <= NF; i++) printf "\t%s", $i; printf "\n" }' > "${tmp_out}"
     header_written=1
   fi
-  tail -n +2 "${validation_tsv}" | awk -F'\t' -v dataset="${dataset}" '
+  tail -n +2 "${source_tsv}" | awk -F'\t' -v dataset="${dataset}" -v exclude_frag="${EXCLUDE_FRAGMENT_JOBS}" '
     NF > 0 {
+      if (exclude_frag == "true" && index($1, "fragon") > 0) {
+        next
+      }
       printf "%s", dataset
       for (i = 1; i <= NF; i++) {
         printf "\t%s", $i
@@ -110,7 +415,12 @@ for dataset_dir in "${ROOT}"/datasets/*; do
       printf "\n"
     }
   ' >> "${tmp_out}"
+  if [[ "${PROGRESSIVE_WRITE}" == "true" ]]; then
+    cp "${tmp_out}" "${OUT_TSV}"
+  fi
 done
+
+echo "[$(timestamp)] AGGREGATE source_summary validation=${source_current_count} legacy=${source_legacy_count} partial=${source_partial_count} missing=${source_missing_count}"
 
 if [[ "${header_written}" == "0" ]]; then
   printf "dataset\n" > "${tmp_out}"

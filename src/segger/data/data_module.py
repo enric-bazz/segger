@@ -228,6 +228,7 @@ class ISTDataModule(LightningDataModule):
                     self.me_gene_pairs, _ = load_me_genes_from_scrna(
                         scrna_path=Path(self.scrna_reference_path),
                         cell_type_column=self.scrna_celltype_column,
+                        gene_name_column="feature_name",
                     )
                 else:
                     raise ValueError(
@@ -267,17 +268,10 @@ class ISTDataModule(LightningDataModule):
                 input_path,
                 boundary_type="all",
                 normalize=True,
+                min_qv=self.min_qv,
+                apply_platform_filters=True,
             )
             tx = tx_lf.collect() if isinstance(tx_lf, pl.LazyFrame) else tx_lf
-
-            # Keep behavior consistent with raw Xenium filtering when quality exists.
-            quality_col = getattr(tx_fields, "quality", "qv")
-            if (
-                self.min_qv is not None
-                and self.min_qv > 0
-                and quality_col in tx.columns
-            ):
-                tx = tx.filter(pl.col(quality_col) >= self.min_qv)
         else:
             pp = get_preprocessor(
                 self.input_directory,
@@ -289,6 +283,52 @@ class ISTDataModule(LightningDataModule):
 
         self.tx = tx
         self.bd = bd
+
+        # Log transcript assignment composition for large datasets where
+        # assignment sparsity can strongly impact memory/runtime behavior.
+        tx_stats_exprs: list[pl.Expr] = [
+            pl.len().alias("__total"),
+            pl.col(tx_fields.cell_id).is_not_null().cast(pl.Int64).sum().alias("__assigned"),
+        ]
+        if tx_fields.compartment in tx.columns:
+            tx_stats_exprs.extend(
+                [
+                    (pl.col(tx_fields.compartment) == tx_fields.nucleus_value)
+                    .cast(pl.Int64)
+                    .sum()
+                    .alias("__nucleus"),
+                    (pl.col(tx_fields.compartment) == tx_fields.cytoplasmic_value)
+                    .cast(pl.Int64)
+                    .sum()
+                    .alias("__cytoplasm"),
+                ]
+            )
+        tx_stats = tx.select(tx_stats_exprs).row(0, named=True)
+        tx_total = int(tx_stats.get("__total", 0) or 0)
+        tx_assigned = int(tx_stats.get("__assigned", 0) or 0)
+        tx_unassigned = max(0, tx_total - tx_assigned)
+        assigned_pct = (100.0 * tx_assigned / tx_total) if tx_total > 0 else 0.0
+        LOGGER.info(
+            "Transcript assignment summary: total=%d assigned=%d (%.2f%%) unassigned=%d (%.2f%%).",
+            tx_total,
+            tx_assigned,
+            assigned_pct,
+            tx_unassigned,
+            (100.0 - assigned_pct) if tx_total > 0 else 0.0,
+        )
+        if tx_fields.compartment in tx.columns:
+            tx_nucleus = int(tx_stats.get("__nucleus", 0) or 0)
+            tx_cytoplasm = int(tx_stats.get("__cytoplasm", 0) or 0)
+            LOGGER.info(
+                "Transcript compartment summary: nucleus=%d cytoplasm=%d.",
+                tx_nucleus,
+                tx_cytoplasm,
+            )
+            if tx_nucleus == 0 and tx_assigned > 0:
+                LOGGER.warning(
+                    "No nucleus-compartment transcripts detected; nucleus-mode "
+                    "supervision/prediction will be downgraded to cell mode."
+                )
 
         if bd is None or len(bd) == 0:
             raise ValueError(
@@ -350,6 +390,7 @@ class ISTDataModule(LightningDataModule):
             boundary_type,
             compartments,
         )
+        effective_prediction_graph_mode = self.prediction_graph_mode
 
         # Some datasets (e.g. MERSCOPE/CosMX variants) may not provide explicit
         # nucleus assignments. Fall back to cell-compartment supervision.
@@ -372,6 +413,12 @@ class ISTDataModule(LightningDataModule):
                 tx_mask = tx_mask_fallback
                 bd_mask = bd_mask_fallback
                 tx_reference = tx_reference_fallback
+                if effective_prediction_graph_mode == "nucleus":
+                    LOGGER.warning(
+                        "Switching prediction graph mode from 'nucleus' to "
+                        "'cell' because nucleus assignments are unavailable."
+                    )
+                    effective_prediction_graph_mode = "cell"
 
         # Generate reference AnnData
         self.ad = setup_anndata(
@@ -399,7 +446,7 @@ class ISTDataModule(LightningDataModule):
             ),
             transcripts_graph_max_k=self.transcripts_graph_max_k,
             transcripts_graph_max_dist=self.transcripts_graph_max_dist,
-            prediction_graph_mode=self.prediction_graph_mode,
+            prediction_graph_mode=effective_prediction_graph_mode,
             prediction_graph_max_k=self.prediction_graph_max_k,
             prediction_graph_scale_factor=self.prediction_graph_scale_factor,
             use_3d=self.use_3d,

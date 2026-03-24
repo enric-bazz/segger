@@ -7,6 +7,7 @@ selection and single-run quality checks.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Optional, Sequence
 
 import anndata as ad
@@ -34,6 +35,95 @@ def valid_cell_id_expr(cell_id_column: str) -> pl.Expr:
 def assigned_cell_expr(cell_id_column: str = "segger_cell_id") -> pl.Expr:
     """Expression selecting transcripts assigned to a valid cell."""
     return valid_cell_id_expr(cell_id_column)
+
+
+_ENSEMBL_WITH_VERSION_RE = re.compile(r"^ENS[A-Z0-9]+(?:\.[0-9]+)$", re.IGNORECASE)
+_REFERENCE_CELLTYPE_COLUMN_ALIASES = (
+    "cell_type",
+    "celltype",
+    "cell_type_fine",
+    "celltype_major",
+    "annotation",
+    "annot",
+    "cell_label",
+    "cluster_annotation",
+)
+
+
+def _normalize_gene_token(gene: object) -> str:
+    """Normalize gene names for robust cross-reference matching.
+
+    Notes
+    -----
+    - Case-insensitive matching avoids human/mouse symbol casing drift.
+    - Version suffixes on Ensembl IDs (e.g. ENSG... .12) are stripped.
+    """
+    token = str(gene).strip()
+    if not token:
+        return ""
+    if _ENSEMBL_WITH_VERSION_RE.match(token):
+        token = token.rsplit(".", 1)[0]
+    return token.upper()
+
+
+def _build_gene_index_map(genes: Sequence[object]) -> tuple[dict[str, int], dict[str, int]]:
+    """Build exact and normalized gene -> index maps."""
+    exact: dict[str, int] = {}
+    normalized: dict[str, int] = {}
+    for idx, raw_gene in enumerate(genes):
+        gene = str(raw_gene)
+        # Keep first index for stable behavior across duplicates.
+        if gene not in exact:
+            exact[gene] = idx
+        norm = _normalize_gene_token(gene)
+        if norm and norm not in normalized:
+            normalized[norm] = idx
+    return exact, normalized
+
+
+def _resolve_reference_celltype_column(
+    ref: ad.AnnData,
+    requested: str,
+) -> str | None:
+    """Resolve requested cell-type column with alias fallback."""
+    if requested in ref.obs.columns:
+        return requested
+    for candidate in _REFERENCE_CELLTYPE_COLUMN_ALIASES:
+        if candidate in ref.obs.columns:
+            return candidate
+    return None
+
+
+def _looks_like_positional_var_names(genes: Sequence[str]) -> bool:
+    """Heuristic for integer-like positional var_names (e.g. 0..N)."""
+    if len(genes) == 0:
+        return False
+    sample = [str(g).strip() for g in genes[: min(len(genes), 256)]]
+    numeric = sum(1 for token in sample if token.isdigit())
+    return numeric >= max(1, int(0.9 * len(sample)))
+
+
+def _reference_gene_names(
+    ref: ad.AnnData,
+    feature_column: str = "feature_name",
+) -> list[str]:
+    """Return robust reference gene names, preferring feature column when needed."""
+    var_names = [str(g) for g in ref.var_names]
+    if feature_column not in ref.var.columns:
+        return var_names
+
+    if not _looks_like_positional_var_names(var_names):
+        return var_names
+
+    feature_values = ref.var[feature_column].astype("string").fillna("")
+    promoted: list[str] = []
+    for fallback, raw in zip(var_names, feature_values.astype(str).tolist()):
+        token = raw.strip()
+        if not token or token.lower() in {"nan", "none"}:
+            promoted.append(fallback)
+        else:
+            promoted.append(token)
+    return promoted
 
 
 def _effective_sample_size(weights: np.ndarray) -> float:
@@ -349,10 +439,11 @@ def _load_reference_type_profiles(
         return None
 
     ref = ad.read_h5ad(scrna_reference_path)
-    if scrna_celltype_column not in ref.obs.columns:
+    resolved_celltype_column = _resolve_reference_celltype_column(ref, scrna_celltype_column)
+    if resolved_celltype_column is None:
         return None
 
-    labels_raw = ref.obs[scrna_celltype_column].astype(str).to_numpy()
+    labels_raw = ref.obs[resolved_celltype_column].astype(str).to_numpy()
     labels = np.asarray([str(x) for x in labels_raw], dtype=object)
     label_norm = np.char.lower(labels.astype(str))
     valid = (
@@ -364,13 +455,16 @@ def _load_reference_type_profiles(
     if not np.any(valid):
         return None
 
-    ref_genes = np.asarray([str(g) for g in ref.var_names], dtype=object)
-    ref_gene_to_idx = {g: i for i, g in enumerate(ref_genes.tolist())}
+    ref_genes = np.asarray(_reference_gene_names(ref, feature_column="feature_name"), dtype=object)
+    ref_gene_to_idx_exact, ref_gene_to_idx_norm = _build_gene_index_map(ref_genes.tolist())
 
     seg_shared_idx: list[int] = []
     ref_shared_idx: list[int] = []
     for i, g in enumerate(seg_gene_names):
-        j = ref_gene_to_idx.get(str(g))
+        sg = str(g)
+        j = ref_gene_to_idx_exact.get(sg)
+        if j is None:
+            j = ref_gene_to_idx_norm.get(_normalize_gene_token(sg))
         if j is None:
             continue
         seg_shared_idx.append(i)
@@ -2183,6 +2277,7 @@ def load_me_gene_pairs(
         pairs, _ = load_me_genes_from_scrna(
             scrna_path=Path(scrna_reference_path),
             cell_type_column=scrna_celltype_column,
+            gene_name_column="feature_name",
         )
         return [(str(g1), str(g2)) for g1, g2 in pairs]
 
@@ -2198,72 +2293,116 @@ def compute_mecr_fast(
     seed: int = 0,
 ) -> dict[str, float]:
     """Compute fast MECR from an AnnData file (lower is better)."""
+    empty = {"mecr_fast": float("nan"), "mecr_ci95_fast": float("nan"), "mecr_pairs_used": 0}
     if anndata_path is None or not Path(anndata_path).exists():
-        return {"mecr_fast": float("nan"), "mecr_ci95_fast": float("nan"), "mecr_pairs_used": 0}
+        return empty
     if len(gene_pairs) == 0:
-        return {"mecr_fast": float("nan"), "mecr_ci95_fast": float("nan"), "mecr_pairs_used": 0}
+        return empty
 
-    adata = ad.read_h5ad(anndata_path)
-    gene_to_idx = {str(g): i for i, g in enumerate(adata.var_names)}
+    adata = None
+    try:
+        adata = ad.read_h5ad(anndata_path, backed="r")
+        var_names = [str(g) for g in adata.var_names]
+        gene_to_idx_exact, gene_to_idx_norm = _build_gene_index_map(var_names)
 
-    valid_pairs: list[tuple[int, int]] = []
-    for g1, g2 in gene_pairs:
-        i = gene_to_idx.get(str(g1))
-        j = gene_to_idx.get(str(g2))
-        if i is None or j is None:
-            continue
-        valid_pairs.append((i, j))
+        valid_pairs: list[tuple[int, int]] = []
+        for g1, g2 in gene_pairs:
+            g1s = str(g1)
+            g2s = str(g2)
+            i = gene_to_idx_exact.get(g1s)
+            if i is None:
+                i = gene_to_idx_norm.get(_normalize_gene_token(g1s))
+            j = gene_to_idx_exact.get(g2s)
+            if j is None:
+                j = gene_to_idx_norm.get(_normalize_gene_token(g2s))
+            if i is None or j is None or i == j:
+                continue
+            valid_pairs.append((int(i), int(j)))
 
-    if len(valid_pairs) == 0:
-        return {"mecr_fast": float("nan"), "mecr_ci95_fast": float("nan"), "mecr_pairs_used": 0}
+        if len(valid_pairs) == 0:
+            return empty
 
-    if max_pairs > 0 and len(valid_pairs) > max_pairs:
-        rng = np.random.default_rng(seed)
-        pick = rng.choice(len(valid_pairs), size=max_pairs, replace=False)
-        valid_pairs = [valid_pairs[int(i)] for i in pick]
+        if max_pairs > 0 and len(valid_pairs) > max_pairs:
+            rng = np.random.default_rng(seed)
+            pick = rng.choice(len(valid_pairs), size=max_pairs, replace=False)
+            valid_pairs = [valid_pairs[int(i)] for i in pick]
 
-    X = adata.X
-    is_sparse = sparse.issparse(X)
-    if is_sparse:
-        X = X.tocsc()
-    else:
-        X = np.asarray(X)
+        # Load only the columns needed for sampled pairs to cap memory usage.
+        unique_cols = sorted({idx for pair in valid_pairs for idx in pair})
+        if len(unique_cols) == 0:
+            return empty
+        col_to_local = {col: pos for pos, col in enumerate(unique_cols)}
+        local_pairs = [(col_to_local[i], col_to_local[j]) for i, j in valid_pairs]
 
-    vals: list[float] = []
-    for i, j in valid_pairs:
+        try:
+            X = adata[:, unique_cols].X
+        except Exception as exc:
+            # Some backed AnnData stores fail indexed reads ("Cannot validate indices").
+            # Fall back to in-memory loading before giving up.
+            print(
+                f"[segger][mecr] WARN backed read failed for {anndata_path}: {exc}; "
+                "retrying in-memory"
+            )
+            try:
+                if getattr(adata, "isbacked", False):
+                    adata.file.close()
+            except Exception:
+                pass
+            adata = ad.read_h5ad(anndata_path)
+            X = adata[:, unique_cols].X
+
+        if hasattr(X, "to_memory"):
+            X = X.to_memory()
+        is_sparse = sparse.issparse(X)
         if is_sparse:
-            a = np.asarray(X.getcol(i).toarray()).ravel()
-            b = np.asarray(X.getcol(j).toarray()).ravel()
+            X = X.tocsc()
         else:
-            a = np.asarray(X[:, i]).ravel()
-            b = np.asarray(X[:, j]).ravel()
+            X = np.asarray(X)
 
-        if soft:
-            den = float(np.maximum(a, b).sum())
-            if den <= 0:
-                continue
-            num = float(np.minimum(a, b).sum())
-            vals.append(num / den)
-        else:
-            a_bin = a > 0
-            b_bin = b > 0
-            either = float((a_bin | b_bin).sum())
-            if either <= 0:
-                continue
-            both = float((a_bin & b_bin).sum())
-            vals.append(both / either)
+        vals: list[float] = []
+        for i, j in local_pairs:
+            if is_sparse:
+                a = np.asarray(X.getcol(i).toarray()).ravel()
+                b = np.asarray(X.getcol(j).toarray()).ravel()
+            else:
+                a = np.asarray(X[:, i]).ravel()
+                b = np.asarray(X[:, j]).ravel()
 
-    if len(vals) == 0:
-        return {"mecr_fast": float("nan"), "mecr_ci95_fast": float("nan"), "mecr_pairs_used": 0}
+            if soft:
+                den = float(np.maximum(a, b).sum())
+                if den <= 0:
+                    continue
+                num = float(np.minimum(a, b).sum())
+                vals.append(num / den)
+            else:
+                a_bin = a > 0
+                b_bin = b > 0
+                either = float((a_bin | b_bin).sum())
+                if either <= 0:
+                    continue
+                both = float((a_bin & b_bin).sum())
+                vals.append(both / either)
 
-    arr = np.asarray(vals, dtype=np.float64)
-    ci95 = float("nan")
-    if arr.size > 1:
-        se = float(np.std(arr, ddof=1)) / np.sqrt(float(arr.size))
-        ci95 = float(1.96 * se)
+        if len(vals) == 0:
+            return {"mecr_fast": float("nan"), "mecr_ci95_fast": float("nan"), "mecr_pairs_used": 0}
 
-    return {
-        "mecr_fast": float(np.mean(arr)),
-        "mecr_ci95_fast": float(ci95),
-        "mecr_pairs_used": int(len(vals)),
-    }
+        arr = np.asarray(vals, dtype=np.float64)
+        ci95 = float("nan")
+        if arr.size > 1:
+            se = float(np.std(arr, ddof=1)) / np.sqrt(float(arr.size))
+            ci95 = float(1.96 * se)
+
+        return {
+            "mecr_fast": float(np.mean(arr)),
+            "mecr_ci95_fast": float(ci95),
+            "mecr_pairs_used": int(len(vals)),
+        }
+    except Exception as exc:
+        print(f"[segger][mecr] WARN failed for {anndata_path}: {exc}")
+        return empty
+    finally:
+        try:
+            if adata is not None and getattr(adata, "isbacked", False):
+                adata.file.close()
+        except Exception:
+            pass

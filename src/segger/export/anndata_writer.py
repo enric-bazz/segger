@@ -8,7 +8,7 @@ table in SpatialData.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -42,6 +42,7 @@ def build_anndata_table(
     region: Optional[str] = None,
     region_key: Optional[str] = None,
     obs_index_as_str: bool = False,
+    obs_metadata: Literal["full", "object_type", "none"] = "full",
 ) -> AnnData:
     """Build AnnData from assigned transcripts.
 
@@ -62,7 +63,19 @@ def build_anndata_table(
         SpatialData table linkage metadata.
     obs_index_as_str
         If True, cast cell IDs to string for ``obs`` index.
+    obs_metadata
+        Controls assignment metadata columns written to ``obs``:
+        - ``"full"``: ``segger_object_type``, ``segger_object_group``,
+          ``segger_is_fragment``
+        - ``"object_type"``: only ``segger_object_type``
+        - ``"none"``: no assignment metadata columns
     """
+    if obs_metadata not in {"full", "object_type", "none"}:
+        raise ValueError(
+            f"Unsupported obs_metadata mode: {obs_metadata!r}. "
+            "Use one of: 'full', 'object_type', 'none'."
+        )
+
     if cell_id_column not in transcripts.columns:
         raise ValueError(f"Missing cell_id column: {cell_id_column}")
     if feature_column not in transcripts.columns:
@@ -101,9 +114,11 @@ def build_anndata_table(
             var_index = pd.Index(var_idx, name=feature_column)
         X = sp.csr_matrix((0, len(var_index)))
         adata = AnnData(X=X, obs=pd.DataFrame(index=obs_index), var=pd.DataFrame(index=var_index))
-        adata.obs[OBJECT_TYPE_COLUMN] = pd.Series([], dtype="object")
-        adata.obs[OBJECT_GROUP_COLUMN] = pd.Series([], dtype="object")
-        adata.obs[FRAGMENT_FLAG_COLUMN] = pd.Series([], dtype=bool)
+        if obs_metadata in {"full", "object_type"}:
+            adata.obs[OBJECT_TYPE_COLUMN] = pd.Series([], dtype="object")
+        if obs_metadata == "full":
+            adata.obs[OBJECT_GROUP_COLUMN] = pd.Series([], dtype="object")
+            adata.obs[FRAGMENT_FLAG_COLUMN] = pd.Series([], dtype=bool)
         if region is not None:
             adata.obs["region"] = region
         if region_key is not None:
@@ -156,25 +171,33 @@ def build_anndata_table(
         var=pd.DataFrame(index=pd.Index(var_ids, name=feature_column)),
     )
 
-    obs_meta = (
-        assigned
-        .group_by(cell_id_column)
-        .agg(
-            [
-                pl.col(OBJECT_TYPE_COLUMN).first().alias(OBJECT_TYPE_COLUMN),
-                pl.col(OBJECT_GROUP_COLUMN).first().alias(OBJECT_GROUP_COLUMN),
-                pl.col(FRAGMENT_FLAG_COLUMN).max().alias(FRAGMENT_FLAG_COLUMN),
-            ]
+    if obs_metadata != "none":
+        agg_exprs = [
+            pl.col(OBJECT_TYPE_COLUMN).first().alias(OBJECT_TYPE_COLUMN),
+        ]
+        if obs_metadata == "full":
+            agg_exprs.extend(
+                [
+                    pl.col(OBJECT_GROUP_COLUMN).first().alias(OBJECT_GROUP_COLUMN),
+                    pl.col(FRAGMENT_FLAG_COLUMN).max().alias(FRAGMENT_FLAG_COLUMN),
+                ]
+            )
+        obs_meta = (
+            assigned
+            .group_by(cell_id_column)
+            .agg(agg_exprs)
+            .to_pandas()
+            .set_index(cell_id_column)
+            .reindex(adata.obs.index)
         )
-        .to_pandas()
-        .set_index(cell_id_column)
-        .reindex(adata.obs.index)
-    )
-    adata.obs[OBJECT_TYPE_COLUMN] = obs_meta[OBJECT_TYPE_COLUMN].fillna(OBJECT_TYPE_CELL)
-    adata.obs[OBJECT_GROUP_COLUMN] = obs_meta[OBJECT_GROUP_COLUMN].fillna("cells")
-    adata.obs[FRAGMENT_FLAG_COLUMN] = (
-        obs_meta[FRAGMENT_FLAG_COLUMN].fillna(False).astype(bool)
-    )
+        adata.obs[OBJECT_TYPE_COLUMN] = obs_meta[OBJECT_TYPE_COLUMN].fillna(
+            OBJECT_TYPE_CELL
+        )
+        if obs_metadata == "full":
+            adata.obs[OBJECT_GROUP_COLUMN] = obs_meta[OBJECT_GROUP_COLUMN].fillna("cells")
+            adata.obs[FRAGMENT_FLAG_COLUMN] = (
+                obs_meta[FRAGMENT_FLAG_COLUMN].fillna(False).astype(bool)
+            )
 
     # Add centroid coordinates if present
     if x_column in assigned.columns and y_column in assigned.columns:
@@ -253,14 +276,6 @@ class AnnDataWriter:
         output_path = output_dir / output_name
         output_paths = split_h5ad_output_paths(output_path)
 
-        if not overwrite:
-            for path in output_paths.values():
-                if path.exists():
-                    raise FileExistsError(
-                        f"Output path exists: {path}. "
-                        "Use overwrite=True to replace."
-                    )
-
         merged = merge_predictions_with_transcripts(
             predictions=predictions,
             transcripts=transcripts,
@@ -274,6 +289,28 @@ class AnnDataWriter:
             cell_id_column=cell_id_column,
             unassigned_value=self.unassigned_marker,
         )
+        has_fragments = split_frames[OBJECT_TYPE_FRAGMENT].height > 0
+        paths_to_write = [
+            output_paths["combined"],
+            output_paths[OBJECT_TYPE_CELL],
+        ]
+        if has_fragments:
+            paths_to_write.append(output_paths[OBJECT_TYPE_FRAGMENT])
+
+        if not overwrite:
+            for path in paths_to_write:
+                if path.exists():
+                    raise FileExistsError(
+                        f"Output path exists: {path}. "
+                        "Use overwrite=True to replace."
+                    )
+            if (not has_fragments) and output_paths[OBJECT_TYPE_FRAGMENT].exists():
+                raise FileExistsError(
+                    f"Output path exists: {output_paths[OBJECT_TYPE_FRAGMENT]}. "
+                    "Remove stale fragment output or use overwrite=True."
+                )
+        elif (not has_fragments) and output_paths[OBJECT_TYPE_FRAGMENT].exists():
+            output_paths[OBJECT_TYPE_FRAGMENT].unlink()
 
         adata = build_anndata_table(
             transcripts=split_frames["all"],
@@ -284,6 +321,7 @@ class AnnDataWriter:
             y_column=y_column,
             z_column=z_column,
             unassigned_value=self.unassigned_marker,
+            obs_metadata="object_type",
         )
         cells_adata = build_anndata_table(
             transcripts=split_frames[OBJECT_TYPE_CELL],
@@ -294,16 +332,7 @@ class AnnDataWriter:
             y_column=y_column,
             z_column=z_column,
             unassigned_value=self.unassigned_marker,
-        )
-        fragments_adata = build_anndata_table(
-            transcripts=split_frames[OBJECT_TYPE_FRAGMENT],
-            var_transcripts=merged,
-            cell_id_column=cell_id_column,
-            feature_column=feature_column,
-            x_column=x_column,
-            y_column=y_column,
-            z_column=z_column,
-            unassigned_value=self.unassigned_marker,
+            obs_metadata="none",
         )
 
         write_kwargs = {}
@@ -314,5 +343,17 @@ class AnnDataWriter:
 
         adata.write_h5ad(output_paths["combined"], **write_kwargs)
         cells_adata.write_h5ad(output_paths[OBJECT_TYPE_CELL], **write_kwargs)
-        fragments_adata.write_h5ad(output_paths[OBJECT_TYPE_FRAGMENT], **write_kwargs)
+        if has_fragments:
+            fragments_adata = build_anndata_table(
+                transcripts=split_frames[OBJECT_TYPE_FRAGMENT],
+                var_transcripts=merged,
+                cell_id_column=cell_id_column,
+                feature_column=feature_column,
+                x_column=x_column,
+                y_column=y_column,
+                z_column=z_column,
+                unassigned_value=self.unassigned_marker,
+                obs_metadata="none",
+            )
+            fragments_adata.write_h5ad(output_paths[OBJECT_TYPE_FRAGMENT], **write_kwargs)
         return output_path

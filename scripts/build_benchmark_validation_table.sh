@@ -5,8 +5,8 @@ usage() {
   cat <<'EOF'
 Build per-job validation metrics table for a benchmark root.
 
-This script intentionally runs the fast validation subset only:
-assigned, mecr, border-contamination, resolvi, tco, and vsi.
+This script intentionally runs a fast validation subset by default:
+assigned + mecr only.
 
 Usage:
   bash scripts/build_benchmark_validation_table.sh [options]
@@ -14,17 +14,28 @@ Usage:
 Options:
   --root <dir>                    Benchmark root (default: ./results/mossi_main_big_benchmark_nightly)
   --input-dir <dir>               Source dataset path for contamination/geometry/doublet metrics (optional)
-  --out-tsv <file>                Output TSV (default: <root>/summaries/validation_metrics.tsv)
+  --out-tsv <file>                Output TSV (default: <root>/summaries/validation_metrics_.tsv)
   --recompute                     Recompute all jobs even if already present in output TSV
   --segger-bin <cmd>              Segger executable/command (default: segger)
   --me-gene-pairs-path <file>     Optional ME-gene pair file passed to segger validate
-  --tissue-type <name>            Optional tissue type passed to segger validate
+  --tissue-type <name>            Disabled in this benchmark workflow (use --scrna-reference-path)
   --scrna-reference-path <file>   Optional scRNA h5ad passed to segger validate
   --scrna-celltype-column <name>  scRNA cell type column (default: cell_type)
   --max-me-gene-pairs <int>       Max sampled ME-gene pairs (default: 500)
   --gpu-a <id>                    GPU id used for group A labels (default: env GPU_A or 0)
   --gpu-b <id>                    GPU id used for group B labels (default: env GPU_B or 1)
   --include-default-10x <bool>    Include ref_10x_cell/ref_10x_nucleus rows (default: true)
+  --exclude-fragment-jobs <bool>  Skip fragment-mode jobs (name contains "fragon") (default: false)
+  --progressive-write <bool>      Update output TSV incrementally while running (default: true)
+  --include-border-contamination <bool>
+                                  Include border-contamination metric (default: false)
+  --include-positive-marker-recall <bool>
+                                  Include positive-marker-recall metric (default: false)
+  --include-center-border-ncv <bool>
+                                  Include center-border-ncv metric (default: false)
+  --include-resolvi <bool>        Include resolvi contamination metric (default: false)
+  --include-tco <bool>            Include transcript-centroid-offset metric (default: false)
+  --include-vsi <bool>            Include VSI metric (default: false)
   --reference-universe-seg <file> Canonical Segger universe segmentation override
   -h, --help                      Show this help
 EOF
@@ -69,6 +80,13 @@ normalize_bool() {
   esac
 }
 
+metric_missing() {
+  local value="${1:-}"
+  local lc
+  lc="$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')"
+  [[ -z "${value}" ]] || [[ "${lc}" == "nan" ]] || [[ "${lc}" == "none" ]] || [[ "${lc}" == "null" ]] || [[ "${value}" == "-" ]]
+}
+
 ROOT="./results/mossi_main_big_benchmark_nightly"
 INPUT_DIR=""
 OUT_TSV=""
@@ -81,16 +99,19 @@ MAX_ME_GENE_PAIRS=500
 GPU_A="${GPU_A:-0}"
 GPU_B="${GPU_B:-1}"
 INCLUDE_DEFAULT_10X="true"
+EXCLUDE_FRAGMENT_JOBS="false"
+PROGRESSIVE_WRITE="true"
+INCLUDE_BORDER_CONTAMINATION="false"
+INCLUDE_POSITIVE_MARKER_RECALL="false"
+INCLUDE_CENTER_BORDER_NCV="false"
+INCLUDE_RESOLVI="false"
+INCLUDE_TCO="false"
+INCLUDE_VSI="false"
 REFERENCE_UNIVERSE_SEG=""
 RECOMPUTE=0
-VALIDATE_FAST_FLAGS=(
-  --assigned
-  --mecr
-  --border-contamination
-  --resolvi
-  --tco
-  --vsi
-)
+VALIDATE_FAST_FLAGS=()
+NEED_SOURCE_INPUT="false"
+NEED_SCRNA_ALIGNMENT="false"
 
 require_value() {
   local opt="$1"
@@ -166,6 +187,46 @@ while [[ $# -gt 0 ]]; do
       INCLUDE_DEFAULT_10X="$2"
       shift 2
       ;;
+    --exclude-fragment-jobs)
+      require_value "$1" "${2-}"
+      EXCLUDE_FRAGMENT_JOBS="$2"
+      shift 2
+      ;;
+    --progressive-write)
+      require_value "$1" "${2-}"
+      PROGRESSIVE_WRITE="$2"
+      shift 2
+      ;;
+    --include-border-contamination)
+      require_value "$1" "${2-}"
+      INCLUDE_BORDER_CONTAMINATION="$2"
+      shift 2
+      ;;
+    --include-positive-marker-recall)
+      require_value "$1" "${2-}"
+      INCLUDE_POSITIVE_MARKER_RECALL="$2"
+      shift 2
+      ;;
+    --include-center-border-ncv)
+      require_value "$1" "${2-}"
+      INCLUDE_CENTER_BORDER_NCV="$2"
+      shift 2
+      ;;
+    --include-resolvi)
+      require_value "$1" "${2-}"
+      INCLUDE_RESOLVI="$2"
+      shift 2
+      ;;
+    --include-tco)
+      require_value "$1" "${2-}"
+      INCLUDE_TCO="$2"
+      shift 2
+      ;;
+    --include-vsi)
+      require_value "$1" "${2-}"
+      INCLUDE_VSI="$2"
+      shift 2
+      ;;
     --reference-universe-seg)
       require_value "$1" "${2-}"
       REFERENCE_UNIVERSE_SEG="$2"
@@ -184,7 +245,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${OUT_TSV}" ]]; then
-  OUT_TSV="${ROOT}/summaries/validation_metrics.tsv"
+  OUT_TSV="${ROOT}/summaries/validation_metrics_.tsv"
 fi
 
 if ! [[ "${MAX_ME_GENE_PAIRS}" =~ ^[0-9]+$ ]] || [[ "${MAX_ME_GENE_PAIRS}" -le 0 ]]; then
@@ -196,9 +257,80 @@ if ! INCLUDE_DEFAULT_10X="$(normalize_bool "${INCLUDE_DEFAULT_10X}")"; then
   echo "ERROR: --include-default-10x must be true/false." >&2
   exit 1
 fi
+if ! EXCLUDE_FRAGMENT_JOBS="$(normalize_bool "${EXCLUDE_FRAGMENT_JOBS}")"; then
+  echo "ERROR: --exclude-fragment-jobs must be true/false." >&2
+  exit 1
+fi
+if ! PROGRESSIVE_WRITE="$(normalize_bool "${PROGRESSIVE_WRITE}")"; then
+  echo "ERROR: --progressive-write must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_BORDER_CONTAMINATION="$(normalize_bool "${INCLUDE_BORDER_CONTAMINATION}")"; then
+  echo "ERROR: --include-border-contamination must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_POSITIVE_MARKER_RECALL="$(normalize_bool "${INCLUDE_POSITIVE_MARKER_RECALL}")"; then
+  echo "ERROR: --include-positive-marker-recall must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_CENTER_BORDER_NCV="$(normalize_bool "${INCLUDE_CENTER_BORDER_NCV}")"; then
+  echo "ERROR: --include-center-border-ncv must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_RESOLVI="$(normalize_bool "${INCLUDE_RESOLVI}")"; then
+  echo "ERROR: --include-resolvi must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_TCO="$(normalize_bool "${INCLUDE_TCO}")"; then
+  echo "ERROR: --include-tco must be true/false." >&2
+  exit 1
+fi
+if ! INCLUDE_VSI="$(normalize_bool "${INCLUDE_VSI}")"; then
+  echo "ERROR: --include-vsi must be true/false." >&2
+  exit 1
+fi
+
+VALIDATE_FAST_FLAGS=(
+  --assigned
+  --mecr
+)
+if [[ "${INCLUDE_POSITIVE_MARKER_RECALL}" == "true" ]]; then
+  VALIDATE_FAST_FLAGS+=(--positive-marker-recall)
+fi
+if [[ "${INCLUDE_CENTER_BORDER_NCV}" == "true" ]]; then
+  VALIDATE_FAST_FLAGS+=(--center-border-ncv)
+fi
+if [[ "${INCLUDE_RESOLVI}" == "true" ]]; then
+  VALIDATE_FAST_FLAGS+=(--resolvi)
+fi
+if [[ "${INCLUDE_TCO}" == "true" ]]; then
+  VALIDATE_FAST_FLAGS+=(--tco)
+fi
+if [[ "${INCLUDE_BORDER_CONTAMINATION}" == "true" ]]; then
+  VALIDATE_FAST_FLAGS+=(--border-contamination)
+fi
+if [[ "${INCLUDE_VSI}" == "true" ]]; then
+  VALIDATE_FAST_FLAGS+=(--vsi)
+fi
+
+if [[ "${INCLUDE_POSITIVE_MARKER_RECALL}" == "true" ]] || [[ "${INCLUDE_RESOLVI}" == "true" ]]; then
+  NEED_SCRNA_ALIGNMENT="true"
+fi
+if [[ "${INCLUDE_POSITIVE_MARKER_RECALL}" == "true" ]] || \
+   [[ "${INCLUDE_BORDER_CONTAMINATION}" == "true" ]] || \
+   [[ "${INCLUDE_CENTER_BORDER_NCV}" == "true" ]] || \
+   [[ "${INCLUDE_RESOLVI}" == "true" ]] || \
+   [[ "${INCLUDE_TCO}" == "true" ]] || \
+   [[ "${INCLUDE_VSI}" == "true" ]]; then
+  NEED_SOURCE_INPUT="true"
+fi
 
 if [[ -n "${INPUT_DIR}" ]] && [[ ! -e "${INPUT_DIR}" ]]; then
   echo "ERROR: --input-dir not found: ${INPUT_DIR}" >&2
+  exit 1
+fi
+if [[ "${NEED_SOURCE_INPUT}" == "true" ]] && [[ -z "${INPUT_DIR}" ]]; then
+  echo "ERROR: --input-dir is required for selected source-dependent metrics." >&2
   exit 1
 fi
 
@@ -207,8 +339,8 @@ if [[ -n "${ME_GENE_PAIRS_PATH}" ]] && [[ ! -f "${ME_GENE_PAIRS_PATH}" ]]; then
   exit 1
 fi
 
-if [[ -n "${TISSUE_TYPE}" && -n "${SCRNA_REFERENCE_PATH}" ]]; then
-  echo "ERROR: --tissue-type and --scrna-reference-path are mutually exclusive." >&2
+if [[ -n "${TISSUE_TYPE}" ]]; then
+  echo "ERROR: --tissue-type is disabled for this benchmark workflow; use --scrna-reference-path with local .h5ad." >&2
   exit 1
 fi
 
@@ -257,21 +389,93 @@ PLAN_FILE="${ROOT}/job_plan.tsv"
 RUNS_DIR="${ROOT}/runs"
 EXPORTS_DIR="${ROOT}/exports"
 SUMMARY_DIR="${ROOT}/summaries"
-LOG_FILE="${SUMMARY_DIR}/validation_metrics.log"
+OUT_TSV_BASENAME="$(basename "${OUT_TSV}")"
+OUT_TSV_STEM="${OUT_TSV_BASENAME}"
+if [[ "${OUT_TSV_STEM}" == *.tsv ]]; then
+  OUT_TSV_STEM="${OUT_TSV_STEM%.tsv}"
+fi
+LOG_FILE="${SUMMARY_DIR}/${OUT_TSV_STEM}.log"
 REFERENCE_ARTIFACTS_DIR="${SUMMARY_DIR}/reference_artifacts"
+VALIDATE_ARTIFACTS_DIR="${SUMMARY_DIR}/validation_artifacts"
+VALIDATE_ROWS_DIR="${VALIDATE_ARTIFACTS_DIR}/rows"
+VALIDATE_CMD_LOGS_DIR="${VALIDATE_ARTIFACTS_DIR}/cmd_logs"
+CURRENT_VALIDATE_ROW_FILE=""
+PARTIAL_OUT_TSV="${SUMMARY_DIR}/${OUT_TSV_STEM}.partial.tsv"
 
 if [[ ! -f "${PLAN_FILE}" ]]; then
   echo "ERROR: Missing benchmark plan file: ${PLAN_FILE}" >&2
   exit 1
 fi
 
-mkdir -p "${SUMMARY_DIR}" "$(dirname "${OUT_TSV}")" "${REFERENCE_ARTIFACTS_DIR}"
+mkdir -p "${SUMMARY_DIR}" "$(dirname "${OUT_TSV}")" "${REFERENCE_ARTIFACTS_DIR}" "${VALIDATE_ROWS_DIR}" "${VALIDATE_CMD_LOGS_DIR}"
+
+LOCK_FILE="${SUMMARY_DIR}/${OUT_TSV_STEM}.lock"
+LOCK_FD=""
+LOCK_MODE=""
+
+if command -v flock >/dev/null 2>&1; then
+  exec {LOCK_FD}> "${LOCK_FILE}"
+  if ! flock -n "${LOCK_FD}"; then
+    echo "ERROR: Validation lock busy for ${ROOT}. Another build may still be running (${LOCK_FILE})." >&2
+    exit 2
+  fi
+  LOCK_MODE="flock"
+else
+  if ( set -o noclobber; : > "${LOCK_FILE}" ) 2>/dev/null; then
+    LOCK_MODE="file"
+  else
+    echo "ERROR: Validation lock busy for ${ROOT}. Another build may still be running (${LOCK_FILE})." >&2
+    exit 2
+  fi
+fi
 
 tmp_out="$(mktemp)"
-tmp_row="$(mktemp "${TMPDIR:-/tmp}/segger_validate_row.XXXXXX.tsv")"
-trap 'rm -f "${tmp_out}" "${tmp_row}"' EXIT
+backup_out=""
+build_completed=0
+if [[ -f "${OUT_TSV}" ]]; then
+  backup_out="$(mktemp "${TMPDIR:-/tmp}/segger_validate_backup.XXXXXX.tsv")"
+  cp "${OUT_TSV}" "${backup_out}"
+fi
 
-METRIC_SCHEMA_VERSION="2026-03-02-v11"
+cleanup_validation_build() {
+  local rc=$?
+  local partial_line_count
+
+  # Avoid leaving partially-written tables behind on interrupted/failed runs.
+  if [[ "${build_completed}" != "1" ]]; then
+    if [[ -f "${tmp_out}" ]]; then
+      partial_line_count="$(wc -l < "${tmp_out}" | tr -d '[:space:]')"
+      if [[ "${partial_line_count:-0}" -gt 1 ]]; then
+        cp "${tmp_out}" "${PARTIAL_OUT_TSV}" 2>/dev/null || true
+        echo "[$(timestamp)] WARN saved partial validation table: ${PARTIAL_OUT_TSV}" >> "${LOG_FILE}" 2>/dev/null || true
+      fi
+    fi
+    if [[ -n "${backup_out}" && -f "${backup_out}" ]]; then
+      cp "${backup_out}" "${OUT_TSV}" 2>/dev/null || true
+    elif [[ "${PROGRESSIVE_WRITE}" == "true" && -f "${OUT_TSV}" ]]; then
+      rm -f "${OUT_TSV}" || true
+    fi
+  else
+    rm -f "${PARTIAL_OUT_TSV}" 2>/dev/null || true
+  fi
+
+  rm -f "${tmp_out}"
+  if [[ -n "${backup_out}" ]]; then
+    rm -f "${backup_out}"
+  fi
+
+  if [[ "${LOCK_MODE}" == "file" ]]; then
+    rm -f "${LOCK_FILE}" 2>/dev/null || true
+  elif [[ "${LOCK_MODE}" == "flock" && -n "${LOCK_FD}" ]]; then
+    eval "exec ${LOCK_FD}>&-"
+  fi
+
+  return "${rc}"
+}
+
+trap cleanup_validation_build EXIT INT TERM
+
+METRIC_SCHEMA_VERSION="2026-03-09-v14-assigned_mecr-pmr_${INCLUDE_POSITIVE_MARKER_RECALL}-cbncv_${INCLUDE_CENTER_BORDER_NCV}-resolvi_${INCLUDE_RESOLVI}-tco_${INCLUDE_TCO}-border_${INCLUDE_BORDER_CONTAMINATION}-vsi_${INCLUDE_VSI}"
 RUN_INPUT_DIR_TOKEN="$(normalize_token "${INPUT_DIR}")"
 if [[ -n "${TISSUE_TYPE}" ]]; then
   RUN_SCRNA_REFERENCE_TOKEN="$(normalize_token "tissue:${TISSUE_TYPE}")"
@@ -308,7 +512,7 @@ fi
 
 get_field() {
   local column_name="$1"
-  if [[ ! -s "${tmp_row}" ]]; then
+  if [[ -z "${CURRENT_VALIDATE_ROW_FILE}" ]] || [[ ! -s "${CURRENT_VALIDATE_ROW_FILE}" ]]; then
     return 0
   fi
   awk -F'\t' -v key="${column_name}" '
@@ -327,7 +531,7 @@ get_field() {
       }
       exit
     }
-  ' "${tmp_row}"
+  ' "${CURRENT_VALIDATE_ROW_FILE}"
 }
 
 get_existing_field_by_job() {
@@ -406,6 +610,136 @@ lookup_gpu_time() {
   printf '%s' "${elapsed}"
 }
 
+resolve_segmentation_path_for_job() {
+  local job_name="$1"
+  local primary_path="${RUNS_DIR}/${job_name}/segger_segmentation.parquet"
+  local fallback_path="${RUNS_DIR}/${job_name}/transcripts.parquet"
+
+  if [[ -f "${primary_path}" ]]; then
+    printf '%s' "${primary_path}"
+    return 0
+  fi
+
+  if [[ -f "${fallback_path}" ]]; then
+    echo "[$(timestamp)] WARN job=${job_name} missing segger_segmentation.parquet; using transcripts.parquet fallback" >> "${LOG_FILE}"
+    printf '%s' "${fallback_path}"
+    return 0
+  fi
+
+  printf '%s' "${primary_path}"
+}
+
+resolve_anndata_path_for_job() {
+  local job_name="$1"
+  local primary_path="${EXPORTS_DIR}/${job_name}/anndata/segger_segmentation.h5ad"
+  local cells_only_path="${EXPORTS_DIR}/${job_name}/anndata/segger_cells.h5ad"
+  local flat_primary_path="${EXPORTS_DIR}/${job_name}/segger_segmentation.h5ad"
+  local flat_cells_only_path="${EXPORTS_DIR}/${job_name}/segger_cells.h5ad"
+  local run_primary_path="${RUNS_DIR}/${job_name}/segger_segmentation.h5ad"
+  local discovered_path=""
+
+  # Preferred canonical export path
+  if [[ -f "${primary_path}" ]]; then
+    printf '%s' "${primary_path}"
+    return 0
+  fi
+
+  # Common alternate export layouts (older scripts/manual exports)
+  for discovered_path in \
+    "${flat_primary_path}" \
+    "${cells_only_path}" \
+    "${flat_cells_only_path}" \
+    "${run_primary_path}"; do
+    if [[ -f "${discovered_path}" ]]; then
+      if [[ "${discovered_path}" == *segger_cells.h5ad ]]; then
+        echo "[$(timestamp)] WARN job=${job_name} missing segger_segmentation.h5ad; using ${discovered_path}" >> "${LOG_FILE}"
+      elif [[ "${discovered_path}" != "${primary_path}" ]]; then
+        echo "[$(timestamp)] WARN job=${job_name} using non-canonical AnnData path: ${discovered_path}" >> "${LOG_FILE}"
+      fi
+      printf '%s' "${discovered_path}"
+      return 0
+    fi
+  done
+
+  # Last resort: search export subtree for a plausible h5ad artifact.
+  discovered_path="$(
+    find "${EXPORTS_DIR}/${job_name}" -maxdepth 3 -type f \( -name 'segger_segmentation.h5ad' -o -name 'segger_cells.h5ad' \) \
+      2>/dev/null | sort | head -n1 || true
+  )"
+  if [[ -n "${discovered_path}" ]]; then
+    echo "[$(timestamp)] WARN job=${job_name} discovered AnnData path via search: ${discovered_path}" >> "${LOG_FILE}"
+    printf '%s' "${discovered_path}"
+    return 0
+  fi
+
+  # Keep canonical target for traceability even when file is absent.
+  printf '%s' "${primary_path}"
+}
+
+resolve_reference_anndata_path_for_job() {
+  local job_name="$1"
+  local reference_primary_path="${REFERENCE_ARTIFACTS_DIR}/${job_name}/segger_segmentation.h5ad"
+  local reference_cells_only_path="${REFERENCE_ARTIFACTS_DIR}/${job_name}/segger_cells.h5ad"
+  local discovered_path=""
+
+  if [[ -f "${reference_primary_path}" ]]; then
+    printf '%s' "${reference_primary_path}"
+    return 0
+  fi
+
+  if [[ -f "${reference_cells_only_path}" ]]; then
+    echo "[$(timestamp)] WARN job=${job_name} missing reference segger_segmentation.h5ad; using ${reference_cells_only_path}" >> "${LOG_FILE}"
+    printf '%s' "${reference_cells_only_path}"
+    return 0
+  fi
+
+  discovered_path="$(
+    find "${REFERENCE_ARTIFACTS_DIR}/${job_name}" -maxdepth 3 -type f \( -name 'segger_segmentation.h5ad' -o -name 'segger_cells.h5ad' \) \
+      2>/dev/null | sort | head -n1 || true
+  )"
+  if [[ -n "${discovered_path}" ]]; then
+    echo "[$(timestamp)] WARN job=${job_name} discovered reference AnnData path via search: ${discovered_path}" >> "${LOG_FILE}"
+    printf '%s' "${discovered_path}"
+    return 0
+  fi
+
+  printf '%s' "${reference_primary_path}"
+}
+
+resolve_any_anndata_path_for_job() {
+  local job_name="$1"
+  local is_reference="${2:-0}"
+  if [[ "${is_reference}" == "1" ]] || [[ "${job_name}" == ref_* ]]; then
+    resolve_reference_anndata_path_for_job "${job_name}"
+    return 0
+  fi
+  resolve_anndata_path_for_job "${job_name}"
+}
+
+get_existing_row_with_field_override() {
+  local job="$1"
+  local field_name="$2"
+  local replacement="$3"
+  awk -F'\t' -v OFS='\t' -v j="${job}" -v f="${field_name}" -v r="${replacement}" '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        if ($i == f) {
+          col = i
+          break
+        }
+      }
+      next
+    }
+    $1 == j {
+      if (col > 0) {
+        $col = r
+      }
+      print
+      exit
+    }
+  ' "${OUT_TSV}"
+}
+
 scale_frac_to_pct() {
   local value="${1:-}"
   local lower
@@ -462,6 +796,10 @@ append_row() {
     "${doublet_pct}" "${doublet_ci95}" "${row_seg_path}" "${row_anndata_path}" "${OUT_TSV}" \
     "$(timestamp)" "${METRIC_SCHEMA_VERSION}" "${RUN_INPUT_DIR_TOKEN}" "${RUN_SCRNA_REFERENCE_TOKEN}" "${RUN_ME_GENE_PAIRS_TOKEN}" "${RUN_REFERENCE_UNIVERSE_TOKEN}" \
     >> "${tmp_out}"
+
+  if [[ "${PROGRESSIVE_WRITE}" == "true" ]]; then
+    cp "${tmp_out}" "${OUT_TSV}"
+  fi
 }
 
 should_reuse_row() {
@@ -489,7 +827,6 @@ should_reuse_row() {
   existing_run_ref_universe="$(get_existing_field_by_job "${job}" "run_reference_universe_seg")"
   existing_cells="$(get_existing_field_by_job "${job}" "cells")"
   existing_is_reference="$(get_existing_field_by_job "${job}" "is_reference")"
-
   should_reuse=1
   reason="ok"
 
@@ -508,26 +845,52 @@ should_reuse_row() {
   elif [[ "${existing_is_reference:-0}" != "${is_reference}" ]]; then
     should_reuse=0
     reason="reference_flag_changed"
-  elif [[ -z "${existing_cells:-}" ]] || [[ "$(printf '%s' "${existing_cells}" | tr '[:upper:]' '[:lower:]')" == "nan" ]]; then
+  elif metric_missing "${existing_cells:-}"; then
     should_reuse=0
     reason="missing_cells"
-  elif [[ -n "${INPUT_DIR}" ]]; then
-    existing_tco="$(get_existing_field_by_job "${job}" "tco")"
-    existing_contam="$(get_existing_field_by_job "${job}" "contamination_pct")"
-    existing_border_ncv="$(get_existing_field_by_job "${job}" "center_border_ncv")"
-    existing_spurious="$(get_existing_field_by_job "${job}" "spurious_coexpression")"
-    existing_morph="$(get_existing_field_by_job "${job}" "reference_morphology_match")"
-    existing_doublet="$(get_existing_field_by_job "${job}" "doublet_pct")"
-    if [[ -z "${existing_tco:-}" ]] || [[ -z "${existing_contam:-}" ]] || [[ -z "${existing_border_ncv:-}" ]] || \
-       [[ -z "${existing_spurious:-}" ]] || [[ -z "${existing_morph:-}" ]] || [[ -z "${existing_doublet:-}" ]]; then
-      should_reuse=0
-      reason="missing_input_dependent_metrics"
-    elif [[ -n "${SCRNA_REFERENCE_PATH}" ]]; then
-      existing_resolvi="$(get_existing_field_by_job "${job}" "resolvi_contamination_pct")"
-      existing_marker_recall="$(get_existing_field_by_job "${job}" "positive_marker_recall_pct")"
-      if [[ -z "${existing_resolvi:-}" ]] || [[ -z "${existing_marker_recall:-}" ]]; then
+  elif [[ "${NEED_SOURCE_INPUT}" == "true" ]]; then
+    if [[ "${INCLUDE_TCO}" == "true" ]]; then
+      existing_tco="$(get_existing_field_by_job "${job}" "tco")"
+      if metric_missing "${existing_tco:-}"; then
         should_reuse=0
-        reason="missing_scrna_dependent_metrics"
+        reason="missing_tco_metric"
+      fi
+    fi
+    if [[ "${should_reuse}" == "1" && "${INCLUDE_BORDER_CONTAMINATION}" == "true" ]]; then
+      existing_contam="$(get_existing_field_by_job "${job}" "contamination_pct")"
+      if metric_missing "${existing_contam:-}"; then
+        should_reuse=0
+        reason="missing_border_contamination_metric"
+      fi
+    fi
+    if [[ "${should_reuse}" == "1" && "${INCLUDE_CENTER_BORDER_NCV}" == "true" ]]; then
+      existing_border_ncv="$(get_existing_field_by_job "${job}" "center_border_ncv")"
+      if metric_missing "${existing_border_ncv:-}"; then
+        should_reuse=0
+        reason="missing_center_border_ncv_metric"
+      fi
+    fi
+    if [[ "${should_reuse}" == "1" && "${INCLUDE_VSI}" == "true" ]]; then
+      existing_doublet="$(get_existing_field_by_job "${job}" "doublet_pct")"
+      if metric_missing "${existing_doublet:-}"; then
+        should_reuse=0
+        reason="missing_vsi_metric"
+      fi
+    fi
+    if [[ "${should_reuse}" == "1" && "${NEED_SCRNA_ALIGNMENT}" == "true" && "${RUN_SCRNA_REFERENCE_TOKEN}" != "-" ]]; then
+      if [[ "${INCLUDE_RESOLVI}" == "true" ]]; then
+        existing_resolvi="$(get_existing_field_by_job "${job}" "resolvi_contamination_pct")"
+        if metric_missing "${existing_resolvi:-}"; then
+          should_reuse=0
+          reason="missing_resolvi_metric"
+        fi
+      fi
+      if [[ "${should_reuse}" == "1" && "${INCLUDE_POSITIVE_MARKER_RECALL}" == "true" ]]; then
+        existing_marker_recall="$(get_existing_field_by_job "${job}" "positive_marker_recall_pct")"
+        if metric_missing "${existing_marker_recall:-}"; then
+          should_reuse=0
+          reason="missing_positive_marker_recall_metric"
+        fi
       fi
     fi
   fi
@@ -540,6 +903,9 @@ run_validate_for_row() {
   local seg_path="$2"
   local anndata_path="$3"
   local apply_elapsed_fallback="$4"
+  local job_tag
+  local row_file
+  local cmd_log_file
 
   validate_status="ok"
   validate_error=""
@@ -566,7 +932,7 @@ run_validate_for_row() {
   doublet_pct="nan"
   doublet_ci95="nan"
   row_seg_path="${seg_path}"
-  row_anndata_path=""
+  row_anndata_path="${anndata_path}"
 
   if [[ ! -f "${seg_path}" ]]; then
     validate_status="missing_segmentation"
@@ -574,26 +940,29 @@ run_validate_for_row() {
     return 0
   fi
 
-  : > "${tmp_row}"
+  job_tag="$(printf '%s' "${job}" | tr -c 'A-Za-z0-9._-' '_')"
+  row_file="${VALIDATE_ROWS_DIR}/${job_tag}.tsv"
+  cmd_log_file="${VALIDATE_CMD_LOGS_DIR}/${job_tag}.log"
+  CURRENT_VALIDATE_ROW_FILE="${row_file}"
+  : > "${row_file}"
+  : > "${cmd_log_file}"
   cmd=(
     "${SEGGER_BIN}" validate
     -s "${seg_path}"
-    -o "${tmp_row}"
+    -o "${row_file}"
     "${VALIDATE_FAST_FLAGS[@]}"
     --max-me-gene-pairs "${MAX_ME_GENE_PAIRS}"
   )
   if [[ -f "${anndata_path}" ]]; then
     cmd+=(-a "${anndata_path}")
   fi
-  if [[ -n "${INPUT_DIR}" ]]; then
+  if [[ "${NEED_SOURCE_INPUT}" == "true" && -n "${INPUT_DIR}" ]]; then
     cmd+=(-i "${INPUT_DIR}")
   fi
   if [[ -n "${ME_GENE_PAIRS_PATH}" ]]; then
     cmd+=(--me-gene-pairs-path "${ME_GENE_PAIRS_PATH}")
   fi
-  if [[ -n "${TISSUE_TYPE}" ]]; then
-    cmd+=(--tissue-type "${TISSUE_TYPE}")
-  elif [[ -n "${SCRNA_REFERENCE_PATH}" ]]; then
+  if [[ -n "${SCRNA_REFERENCE_PATH}" ]]; then
     cmd+=(
       --scrna-reference-path "${SCRNA_REFERENCE_PATH}"
       --scrna-celltype-column "${SCRNA_CELLTYPE_COLUMN}"
@@ -604,9 +973,13 @@ run_validate_for_row() {
     printf '[%s] job=%s CMD:' "$(timestamp)" "${job}"
     printf ' %q' "${cmd[@]}"
     printf '\n'
+    printf '[%s] job=%s ARTIFACTS: row=%s cmd_log=%s\n' "$(timestamp)" "${job}" "${row_file}" "${cmd_log_file}"
   } >> "${LOG_FILE}"
 
-  if "${cmd[@]}" >> "${LOG_FILE}" 2>&1; then
+  local failure_hint
+
+  if "${cmd[@]}" > "${cmd_log_file}" 2>&1; then
+    cat "${cmd_log_file}" >> "${LOG_FILE}"
     parsed_status="$(get_field "validate_status")"
     [[ -n "${parsed_status}" ]] && validate_status="${parsed_status}"
     parsed_error="$(get_field "validate_error")"
@@ -697,19 +1070,43 @@ run_validate_for_row() {
     parsed_val="$(get_field "anndata_path")"
     [[ -n "${parsed_val}" ]] && row_anndata_path="${parsed_val}"
   else
+    cat "${cmd_log_file}" >> "${LOG_FILE}"
     validate_status="validate_command_failed"
-    validate_error="segger validate command failed"
+    failure_hint="$(
+      tail -n 8 "${cmd_log_file}" \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]\+/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//'
+    )"
+    if [[ -n "${failure_hint}" ]]; then
+      validate_error="segger validate command failed: ${failure_hint}"
+    else
+      validate_error="segger validate command failed"
+    fi
   fi
+
 }
 
 printf "%s\n" "${OUTPUT_HEADER}" > "${tmp_out}"
+if [[ "${PROGRESSIVE_WRITE}" == "true" ]]; then
+  cp "${tmp_out}" "${OUT_TSV}"
+fi
 
 echo "[$(timestamp)] START benchmark validation table build" >> "${LOG_FILE}"
 echo "[$(timestamp)] ROOT=${ROOT}" >> "${LOG_FILE}"
 echo "[$(timestamp)] OUT_TSV=${OUT_TSV}" >> "${LOG_FILE}"
 echo "[$(timestamp)] RECOMPUTE=${RECOMPUTE}" >> "${LOG_FILE}"
 echo "[$(timestamp)] INCLUDE_DEFAULT_10X=${INCLUDE_DEFAULT_10X}" >> "${LOG_FILE}"
+echo "[$(timestamp)] EXCLUDE_FRAGMENT_JOBS=${EXCLUDE_FRAGMENT_JOBS}" >> "${LOG_FILE}"
+echo "[$(timestamp)] PROGRESSIVE_WRITE=${PROGRESSIVE_WRITE}" >> "${LOG_FILE}"
+echo "[$(timestamp)] INCLUDE_POSITIVE_MARKER_RECALL=${INCLUDE_POSITIVE_MARKER_RECALL}" >> "${LOG_FILE}"
+echo "[$(timestamp)] INCLUDE_CENTER_BORDER_NCV=${INCLUDE_CENTER_BORDER_NCV}" >> "${LOG_FILE}"
+echo "[$(timestamp)] INCLUDE_RESOLVI=${INCLUDE_RESOLVI}" >> "${LOG_FILE}"
+echo "[$(timestamp)] INCLUDE_TCO=${INCLUDE_TCO}" >> "${LOG_FILE}"
+echo "[$(timestamp)] INCLUDE_BORDER_CONTAMINATION=${INCLUDE_BORDER_CONTAMINATION}" >> "${LOG_FILE}"
+echo "[$(timestamp)] INCLUDE_VSI=${INCLUDE_VSI}" >> "${LOG_FILE}"
+echo "[$(timestamp)] NEED_SOURCE_INPUT=${NEED_SOURCE_INPUT}" >> "${LOG_FILE}"
 echo "[$(timestamp)] REFERENCE_UNIVERSE_SEG=${RUN_REFERENCE_UNIVERSE_TOKEN}" >> "${LOG_FILE}"
+echo "[$(timestamp)] LOCK=${LOCK_FILE} mode=${LOCK_MODE} pid=$$" >> "${LOG_FILE}"
 
 reused_count=0
 computed_count=0
@@ -719,13 +1116,29 @@ while IFS=$'\t' read -r \
   if [[ -z "${job:-}" ]] || [[ "${job}" == "job" ]]; then
     continue
   fi
+  if [[ "${EXCLUDE_FRAGMENT_JOBS}" == "true" ]] && [[ "${job}" == *fragon* ]]; then
+    echo "[$(timestamp)] SKIP job=${job}: excluded fragment job" >> "${LOG_FILE}"
+    continue
+  fi
 
   reuse_info="$(should_reuse_row "${job}" "0")"
   should_reuse="${reuse_info%%$'\t'*}"
   reuse_reason="${reuse_info#*$'\t'}"
   if [[ "${should_reuse}" == "1" ]]; then
     existing_row="$(awk -F'\t' -v j="${job}" 'NR > 1 && $1 == j { print; exit }' "${OUT_TSV}")"
+    existing_anndata_path="$(get_existing_field_by_job "${job}" "anndata_path")"
+    if [[ -z "${existing_anndata_path:-}" ]] || [[ "${existing_anndata_path}" == "-" ]]; then
+      backfilled_anndata_path="$(resolve_any_anndata_path_for_job "${job}" "0")"
+      patched_row="$(get_existing_row_with_field_override "${job}" "anndata_path" "${backfilled_anndata_path}")"
+      if [[ -n "${patched_row}" ]]; then
+        existing_row="${patched_row}"
+      fi
+      echo "[$(timestamp)] SKIP job=${job}: existing row reused with anndata_path backfill (${backfilled_anndata_path})" >> "${LOG_FILE}"
+    fi
     printf "%s\n" "${existing_row}" >> "${tmp_out}"
+    if [[ "${PROGRESSIVE_WRITE}" == "true" ]]; then
+      cp "${tmp_out}" "${OUT_TSV}"
+    fi
     reused_count=$((reused_count + 1))
     echo "[$(timestamp)] SKIP job=${job}: existing row reused" >> "${LOG_FILE}"
     continue
@@ -741,8 +1154,8 @@ while IFS=$'\t' read -r \
     gpu="${GPU_B}"
   fi
 
-  seg_path="${RUNS_DIR}/${job}/segger_segmentation.parquet"
-  anndata_path="${EXPORTS_DIR}/${job}/anndata/segger_segmentation.h5ad"
+  seg_path="$(resolve_segmentation_path_for_job "${job}")"
+  anndata_path="$(resolve_anndata_path_for_job "${job}")"
   gpu_time_s="$(lookup_gpu_time "${job}" "${gpu}")"
 
   start_ts="$(date +%s)"
@@ -772,7 +1185,19 @@ if [[ "${INCLUDE_DEFAULT_10X}" == "true" ]]; then
     reuse_reason="${reuse_info#*$'\t'}"
     if [[ "${should_reuse}" == "1" ]]; then
       existing_row="$(awk -F'\t' -v j="${job}" 'NR > 1 && $1 == j { print; exit }' "${OUT_TSV}")"
+      existing_anndata_path="$(get_existing_field_by_job "${job}" "anndata_path")"
+      if [[ -z "${existing_anndata_path:-}" ]] || [[ "${existing_anndata_path}" == "-" ]]; then
+        backfilled_anndata_path="$(resolve_any_anndata_path_for_job "${job}" "1")"
+        patched_row="$(get_existing_row_with_field_override "${job}" "anndata_path" "${backfilled_anndata_path}")"
+        if [[ -n "${patched_row}" ]]; then
+          existing_row="${patched_row}"
+        fi
+        echo "[$(timestamp)] SKIP job=${job}: existing row reused with anndata_path backfill (${backfilled_anndata_path})" >> "${LOG_FILE}"
+      fi
       printf "%s\n" "${existing_row}" >> "${tmp_out}"
+      if [[ "${PROGRESSIVE_WRITE}" == "true" ]]; then
+        cp "${tmp_out}" "${OUT_TSV}"
+      fi
       reused_count=$((reused_count + 1))
       echo "[$(timestamp)] SKIP job=${job}: existing row reused" >> "${LOG_FILE}"
       continue
@@ -862,8 +1287,8 @@ tmp_sorted="$(mktemp)"
           return v + 0.0
         }
         {
-          assigned = norm_num($10)
-          mecr = norm_num($12)
+          assigned = norm_num($11)
+          mecr = norm_num($15)
           if (assigned == "") assigned_key = -1
           else assigned_key = assigned
           if (mecr == "") mecr_key = 1e99
@@ -877,6 +1302,7 @@ tmp_sorted="$(mktemp)"
 mv "${tmp_sorted}" "${tmp_out}"
 
 mv "${tmp_out}" "${OUT_TSV}"
+build_completed=1
 echo "[$(timestamp)] WROTE validation table: ${OUT_TSV}" >> "${LOG_FILE}"
 echo "[$(timestamp)] SUMMARY reused=${reused_count} computed=${computed_count}" >> "${LOG_FILE}"
 echo "Wrote validation table: ${OUT_TSV} (reused=${reused_count}, computed=${computed_count})"

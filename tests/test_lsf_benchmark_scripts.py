@@ -60,7 +60,10 @@ def test_run_lsf_script_dry_run_creates_compatible_dataset_root(tmp_path: Path) 
     assert align_script.exists()
 
     lines = plan_file.read_text().strip().splitlines()
-    assert lines[0] == "job\tgroup\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss"
+    assert lines[0] == (
+        "job\tgroup\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\t"
+        "mode\tfragment_mode\tqueue\tgmem_gb\tmem_gb\twall_time"
+    )
     assert len(lines) == 12
     assert any(line.startswith("align_0p01\t") for line in lines[1:])
     assert any(line.startswith("align_0p03\t") for line in lines[1:])
@@ -114,6 +117,146 @@ def test_run_lsf_script_uses_split_export_scripts_and_schedulable_fragment_resou
     assert "xenium_missing_source_will_skip" in gpu0_text
 
 
+def test_run_lsf_script_routes_crc_to_gpu_when_eligible_by_default(tmp_path: Path) -> None:
+    output_root = tmp_path / "lsf_benchmark"
+    env = {
+        "OUTPUT_ROOT": str(output_root),
+        "DATASET_KEYS": "xenium_crc",
+        "DRY_RUN": "1",
+        "AUTO_SUBMIT": "0",
+        "RUN_VALIDATION_TABLE": "0",
+        "RUN_STATUS_SNAPSHOT": "0",
+        "ROUTE_ELIGIBLE_TO_GPU": "1",
+    }
+
+    _run_script(RUN_SCRIPT, env)
+
+    baseline_script = output_root / "datasets" / "xenium_crc" / "bsub" / "baseline.attempt1.sh"
+    assert baseline_script.exists()
+    baseline_text = baseline_script.read_text()
+    assert "#BSUB -q gpu" in baseline_text
+    assert '#BSUB -gpu "num=1:j_exclusive=yes:gmem=30G"' in baseline_text
+
+
+def test_run_lsf_script_can_force_crc_to_gpu_pro(tmp_path: Path) -> None:
+    output_root = tmp_path / "lsf_benchmark"
+    env = {
+        "OUTPUT_ROOT": str(output_root),
+        "DATASET_KEYS": "xenium_crc",
+        "DRY_RUN": "1",
+        "AUTO_SUBMIT": "0",
+        "RUN_VALIDATION_TABLE": "0",
+        "RUN_STATUS_SNAPSHOT": "0",
+        "ROUTE_ELIGIBLE_TO_GPU": "1",
+        "FORCE_GPU_PRO_DATASETS": "xenium_crc",
+    }
+
+    _run_script(RUN_SCRIPT, env)
+
+    baseline_script = output_root / "datasets" / "xenium_crc" / "bsub" / "baseline.attempt1.sh"
+    assert baseline_script.exists()
+    baseline_text = baseline_script.read_text()
+    assert "#BSUB -q gpu-pro" in baseline_text
+    assert '#BSUB -gpu "num=1:j_exclusive=yes:gmem=30G"' in baseline_text
+
+
+def test_run_lsf_script_retry_fallback_bumps_gmem_and_escalates_queue(tmp_path: Path) -> None:
+    output_root = tmp_path / "lsf_benchmark"
+    env = {
+        "OUTPUT_ROOT": str(output_root),
+        "DATASET_KEYS": "xenium_breast",
+        "DRY_RUN": "1",
+        "AUTO_SUBMIT": "0",
+        "RUN_VALIDATION_TABLE": "0",
+        "RUN_STATUS_SNAPSHOT": "0",
+        "ROUTE_ELIGIBLE_TO_GPU": "1",
+        "GPU_QUEUE_MAX_MEM_GB": "384",
+    }
+
+    _run_script(RUN_SCRIPT, env)
+
+    dataset_root = output_root / "datasets" / "xenium_breast"
+    baseline_attempt1_err = dataset_root / "logs" / "baseline.attempt1.err"
+    baseline_attempt1_err.write_text("CUDA error: out of memory\n")
+
+    _run_script(RUN_SCRIPT, env)
+
+    baseline_attempt2_script = dataset_root / "bsub" / "baseline.attempt2.sh"
+    assert baseline_attempt2_script.exists()
+    baseline_attempt2_text = baseline_attempt2_script.read_text()
+    assert "#BSUB -q gpu-pro" in baseline_attempt2_text
+    assert '#BSUB -gpu "num=1:j_exclusive=yes:gmem=50G"' in baseline_attempt2_text
+    assert '#BSUB -R "rusage[mem=512G]"' in baseline_attempt2_text
+
+    gpu0_rows = (dataset_root / "summaries" / "gpu0.tsv").read_text()
+    assert "gmem_bump=+20G" in gpu0_rows
+
+
+def test_run_lsf_script_export_only_mode_skips_jobs_without_primary_outputs(tmp_path: Path) -> None:
+    output_root = tmp_path / "lsf_benchmark"
+    dataset_root = output_root / "datasets" / "xenium_crc"
+    baseline_seg_dir = dataset_root / "runs" / "baseline"
+    baseline_seg_dir.mkdir(parents=True, exist_ok=True)
+    (baseline_seg_dir / "segger_segmentation.parquet").write_text("seg")
+    (baseline_seg_dir / ".segment_status").write_text("segment_status=segment_ok\nsegment_rc=0\n")
+
+    env = {
+        "OUTPUT_ROOT": str(output_root),
+        "DATASET_KEYS": "xenium_crc",
+        "DRY_RUN": "1",
+        "AUTO_SUBMIT": "0",
+        "RUN_VALIDATION_TABLE": "0",
+        "RUN_STATUS_SNAPSHOT": "0",
+        "RUN_PRIMARY_JOBS": "0",
+        "RUN_EXPORT_JOBS": "1",
+        "RUN_ANNDATA_EXPORT": "1",
+        "RUN_XENIUM_EXPORT": "0",
+    }
+
+    _run_script(RUN_SCRIPT, env)
+
+    baseline_export_script = dataset_root / "bsub" / "baseline.export.attempt1.sh"
+    use3d_primary_script = dataset_root / "bsub" / "use3d_true.attempt1.sh"
+    assert baseline_export_script.exists()
+    assert not use3d_primary_script.exists()
+
+    all_jobs = (dataset_root / "summaries" / "all_jobs.tsv").read_text().splitlines()
+    header = all_jobs[0].split("\t")
+    rows = {line.split("\t")[0]: dict(zip(header, line.split("\t"))) for line in all_jobs[1:]}
+    assert rows["baseline"]["status"] == "pending"
+    assert rows["use3d_true"]["status"] == "skipped_filter"
+    assert rows["use3d_true"]["export_note"] == "primary_disabled"
+
+
+def test_run_lsf_script_does_not_reuse_primary_outputs_without_success_status_by_default(tmp_path: Path) -> None:
+    output_root = tmp_path / "lsf_benchmark"
+    dataset_root = output_root / "datasets" / "xenium_crc"
+    baseline_seg_dir = dataset_root / "runs" / "baseline"
+    baseline_export_dir = dataset_root / "exports" / "baseline" / "anndata"
+    baseline_seg_dir.mkdir(parents=True, exist_ok=True)
+    baseline_export_dir.mkdir(parents=True, exist_ok=True)
+    (baseline_seg_dir / "segger_segmentation.parquet").write_text("seg")
+    (baseline_export_dir / "segger_segmentation.h5ad").write_text("h5ad")
+
+    env = {
+        "OUTPUT_ROOT": str(output_root),
+        "DATASET_KEYS": "xenium_crc",
+        "DRY_RUN": "1",
+        "AUTO_SUBMIT": "0",
+        "RUN_VALIDATION_TABLE": "0",
+        "RUN_STATUS_SNAPSHOT": "0",
+        "RUN_XENIUM_EXPORT": "0",
+    }
+
+    _run_script(RUN_SCRIPT, env)
+
+    all_jobs = (dataset_root / "summaries" / "all_jobs.tsv").read_text().splitlines()
+    header = all_jobs[0].split("\t")
+    rows = {line.split("\t")[0]: dict(zip(header, line.split("\t"))) for line in all_jobs[1:]}
+    assert rows["baseline"]["status"] == "pending"
+    assert rows["baseline"]["segment_status"] == "pending"
+
+
 def test_dashboard_promotes_stale_pending_rows_from_artifacts(tmp_path: Path) -> None:
     output_root = tmp_path / "lsf_benchmark"
     env = {
@@ -157,8 +300,8 @@ def test_dashboard_promotes_stale_pending_rows_from_artifacts(tmp_path: Path) ->
             values = line.strip().split("\t")
             rows[values[0]] = dict(zip(header, values))
 
-    assert rows["baseline"]["status"] == "partial"
-    assert rows["baseline"]["state"] == "partial"
+    assert rows["baseline"]["status"] == "ok"
+    assert rows["baseline"]["state"] == "done"
     assert rows["use3d_true"]["status"] == "ok"
     assert rows["use3d_true"]["state"] == "done"
 
@@ -237,6 +380,30 @@ def test_dashboard_uses_lsf_job_state_for_transient_rows(tmp_path: Path) -> None
     assert rows["pred_sf1p2_fragon"]["state"] == "failed"
 
 
+def test_dashboard_minimal_mode_shows_compact_jobs_overview(tmp_path: Path) -> None:
+    output_root = tmp_path / "lsf_benchmark"
+    env = {
+        "OUTPUT_ROOT": str(output_root),
+        "DATASET_KEYS": "xenium_crc",
+        "DRY_RUN": "1",
+        "AUTO_SUBMIT": "0",
+        "RUN_VALIDATION_TABLE": "0",
+        "RUN_STATUS_SNAPSHOT": "0",
+    }
+
+    _run_script(RUN_SCRIPT, env)
+
+    dataset_root = output_root / "datasets" / "xenium_crc"
+    result = _run_script(DASHBOARD_SCRIPT, {"ROOT": str(dataset_root)}, "--root", str(dataset_root), "--minimal")
+
+    assert "Done Jobs:" in result.stdout
+    assert "Failed Jobs:" in result.stdout
+    assert "anndata" in result.stdout
+    assert "Jobs Overview:" not in result.stdout
+    assert "All Jobs Overview:" not in result.stdout
+    assert "State Counts:" not in result.stdout
+
+
 def test_dashboard_marks_export_failures_failed_and_points_to_attempt_err(tmp_path: Path) -> None:
     output_root = tmp_path / "lsf_benchmark"
     env = {
@@ -274,7 +441,7 @@ def test_dashboard_marks_export_failures_failed_and_points_to_attempt_err(tmp_pa
     assert rows["baseline"]["log_file"] == str(attempt_err)
 
 
-def test_dashboard_points_partial_rows_to_attempt_err_log(tmp_path: Path) -> None:
+def test_dashboard_marks_segmentation_only_rows_done_and_uses_canonical_log(tmp_path: Path) -> None:
     output_root = tmp_path / "lsf_benchmark"
     env = {
         "OUTPUT_ROOT": str(output_root),
@@ -305,9 +472,9 @@ def test_dashboard_points_partial_rows_to_attempt_err_log(tmp_path: Path) -> Non
             values = line.strip().split("\t")
             rows[values[0]] = dict(zip(header, values))
 
-    assert rows["baseline"]["status"] == "partial"
-    assert rows["baseline"]["state"] == "partial"
-    assert rows["baseline"]["log_file"] == str(attempt_err)
+    assert rows["baseline"]["status"] == "segment_only"
+    assert rows["baseline"]["state"] == "done"
+    assert rows["baseline"]["log_file"] == str(dataset_root / "logs" / "baseline.gpu0.log")
 
 
 def test_dashboard_treats_skipped_xenium_export_as_success(tmp_path: Path) -> None:

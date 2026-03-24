@@ -1,0 +1,481 @@
+You are here: Omics IT and Data Management Core Facility (ODCF) » Public ODCF Wiki » DKFZ Cluster Wiki » LSF Job Scheduling » GPU Queues
+GPU Queues
+Introduction
+General information
+Dear potential GPU queue user, please make sure to read the following precisely to avoid problems or crash the setup. Be especially aware of that:
+
+The cluster is only for productive usage. Precondition for all users is, that they have their own GPU available for testing. Only experienced users are allowed to submit to the cluster. Experimental setups must already been tested locally.
+Keep an eye on the efficiency of your jobs. If possible the gpu utilization should be more than 80%.
+You can really disturb others by improper usage, hence should follow the here specified guidelines
+From these points it directly follows that: If you develop new scripts etc., first run and test these on your local machine. If everything runs smoothly, then bring it to the cluster and run the real experiments. Only a few things are more frustrating than getting our GPU time soaked up by hacky scripts that are IO or CPU bottlenecked, dangling around in an infinity loop or making senseless calculations. Furthermore make sure to read user information that is spread via the mailinglist to adapt in time to environment modifications. And finally always double check on your commands both on typos as well as good sense.
+
+If in doubt ask someone of the mailinglist for help or introduction.
+
+Queue-View
+The following queues are available for GPU jobs. Use the bqueues command to get more information about the individual queues and refer to GPU Queues for more information about submitting GPU jobs.
+
+Due to massive disruptions the wall times have been temporary increased to 142 hours for the gpu-pro queue and 72 hours for both gpu and gpu-lowprio queues.
+
+Name	Runtime limit	Memory limits [GB]	Note
+default	maximum
+gpu-pro	72 hours	memory is automatically assigned	launching at 06.08.2025 13:00
+gpu	24 hours	memory is automatically assigned	default queue - migration from gpu-debian
+gpu-lowprio	24 hours	memory is automatically assigned	low prio queue - migration from gpu-lowprio-debian
+gpu-interactive	10 hours	memory is automatically assigned	default interactive queue - migration from gpu-default-interactive
+
+Infrastructure overview
+The infrastructure is based on IBM Spectrum LSF. General information can be found at Cluster Basics and Cluster Overview, but short things short, there are three major components of interest for you:
+
+The submission hosts (bsub01.lsf.dkfz.de and bsub02.lsf.dkfz.de) you will be submitting jobs from.
+The worker nodes (odcf-worker01.dkfz.de and odcf-worker02.dkfz.de) to set up your environment.
+The GPU nodes (see GPU Queue Nodes for a complete list) where your code will be running.
+ATTENTION!: If you want to submit to Debian queues you should submit via bsub01.lsf.dkfz.de or work on odcf-worker01.dkfz.de as those are Debian nodes. bsub02.lsf.dkfz.de and odcf-worker02.dkfz.de are still running with CentOS and will have a different software stack which is only compatible with CentOS nodes, NOT Debian nodes This will be changed as soon as the submission nodes have been migrated to Debian
+
+There are clear restrictions on what you should do from which machine in the cluster! Hence make always sure to be logged into the correct device for your current intent! What usually happens is that you prepare and upload your code to the worker put the necessary data for your experiment to the nodes and submit your job from one of the hosts. Details on the precise workflow are below.
+
+GPU-Policies
+All rules and policies regarding GPU usage can be found at GPU Usage Rules
+
+Prerequisites
+There are a few things that have to be done before you can start your number crunching and be aware that some of them may take a couple of days, therefore plan accordingly and take your time to get things done correctly.
+
+Getting Access
+If you want to get access to the GPU queue, please contact the DKFZ Cluster Administration. This step may take a couple of days depending on workload and holidays!
+NOTE:: Access to the gpu-pro queue requires a special request procedure.
+If you have access to the cluster, you will probably receive an email stating “your account has been activated on the LSF Cluster” and you will be added to the cluster-users mailing list. This mailing list handles the complete DKFZ cluster.
+If everything is clarified, your AD account will be granted access to the cluster nodes.
+Preparation
+To prepare yourself for setting up everything please finally go through the following.
+
+it might be worth to have a prior look at the following ODCF wiki pages:
+Bash Initialization on in which cases which resource is loaded into your bash
+Environment Modules on how software packages should be loaded within the cluster
+how virtual environments should be handled
+in addition if you should not be familiar with some bash commands that will be used often, refresh your knowledge on
+ssh that will be used to log into the servers
+rsync that allows for fast and efficient file transfer
+commands for navigation on the file system (e.g. pwd, cd, ll, …)
+some terminal editor (e.g. vim or nano)
+File system structure
+The folders described in this section are available on all GPU nodes and the submission and worker nodes.
+
+Running deep learning experiments (which is the primary use case of the GPU queue) has specific requirements on the speed and latency with which data can be read and stored. Most datasets are too large to fit into the RAM of the nodes they are running on, requiring the script to continuously load training examples from either a local SSD or a fast network drive. To satisfy this need for fast I/O, we have spent HDF funding to purchase a flashblade. The flashblade is essentially very fast SSD storage as a network drive. It is mounted at /dkfz/cluster/gpu/data and available on all GPU nodes as well as the worker and submission hosts. You can use this mount to store the training data you currently need for your experiments. Your scripts can directly read the data from there while the training is running. Please use the folder located at /dkfz/cluster/gpu/data/{DEPARTMENT-OE}/{USERNAME} Since the flashblade storage is extremely expensive and shared between all users we ask you to use it sensibly: always only store the training data that you currently need for your experiments and remove data that you will not be using in the next weeks!
+
+Due to the cost associated with the flashblade, it should only be used for data that require extremely fast I/O. Therefore, this location is not suited to save your model checkpoints and other results created by your scripts. These should be stored in /dkfz/cluster/gpu/checkpoints/{DEPARTMENT-OE}/{USERNAME}. Just like /dkfz/cluster/gpu/data, this folder is only intended as temporary storage. You need to move your results to your local workstation or your department's network drive regularly in order to not exceed the 500GB quota!
+
+Please set up your cluster environment to use the following folders:
+
+/home/{USERNAME}/ You can use your home directory to store your python virtual environment as well as git repositories and other code you will be using. Note that the home directory has a quota of 20GB! You should also create a .bashrc in here.
+/dkfz/cluster/gpu/checkpoints/{DEPARTMENT-OE}/{USERNAME}/ This is the folder where you are supposed to save the output of your scripts (checkpoints, models, plots, everything!). Use this only for temporal storage! Regularly move old files to your department's network drives or your local workstation! There is a quota of 500GB per user!
+/dkfz/cluster/gpu/data/{DEPARTMENT-OE}/{USERNAME}/ This is where you can store the data you need for running your experiments. This folder is located on a flashblade and therefore has very fast I/O (it behaves like a local SSD!). This storage is very expensive - so please only store the data you currently need and remove old datasets regularly!
+You can find your “DEPARTMENT-OE” Number on the DKFZ the user portal: https://info.dkfz-heidelberg.de/itcf/UserPortal > user service > my accounts
+USERNAME must be your AD account
+If you do not see your “DEPARTMENT-OE” or “USERNAME” folder - get in contact and we'll create those for you
+
+Software
+A short note on the software that you might be using.
+
+Python
+use Modules to activate python 3.10
+it works like this module load Python/3.10.8-GCCcore-14.1.0
+the modules Python/3.10.8-GCCcore-14.1.0 and Python/3.12.4-GCCcore-14.1.0 are available
+this gives access to the virtualenv command. Use it to create your own virtual environment
+you can access your virtual environment from any cluster node for your jobs to use
+CUDA
+cuda 10.2, 11.0, 11.7 and 12.2 are available for you to use. Don't worry if you don't see them from the odcf-worker01 node - they are present only on GPU nodes.
+create a .bashrc file that exports the cuda path of the version you would like to use (as shown in bash resource setup (.bashrc))
+.bashrc is not always loaded when starting a job. Thus, the first line of your script should be source /home/{USERNAME}/.bashrc (as shown in runner script setup (optional))
+Usage Policy
+Finally always keep in mind these restrictions:
+
+Due to the configuration of the nodes, DO NOT use more than 12 CPUs (12 threads!) and 45 GB of RAM per GPU!
+If you know what you are doing you can adapt these numbers according to the specific node you submit your job to, but these are the defaults!
+IMPORTANT exception! Please only use 10 CPUs per GPU when submitting to e230-dgx1-1 and only 6 CPUs when submitting to e230-dgx2-2 and e230-dgx2-1!
+Due to ressource restrictions one user can only allocate around 84GB RAM per GPU
+Your jobs should not run longer than 2 day!
+Deadlines happen and may entail lots of last-minute experiments. That's usually fine, but please let everyone else know via the Mailing List before flooding queues!
+Interactive sessions are disabled for queues: gpu; gpu-debian; gpu-lowprio
+Do not use job arrays. They conflict with our monitoring system.
+Jobs with mode=exclusive_process will be rejected because this would crash the whole node using multi-GPU jobs.
+Initial Setup of your cluster code infrastructure
+This section will guide you through the steps of initially preparing your experiment (that already runs successfully on your local machine) on the cluster. It includes the following steps, assuming that you met the prerequesites (and are working with python code):
+
+setting up your code and data set locations
+setting up an virtual environment
+setting up a bash resource file
+(optional) setting up your runner script
+(optional) adapting your source code
+These steps should only be necessary once, nevertheless if you have not been working on the cluster for a while and changes applied in the meantime or you switch your project small adaptions might be necessary. In the following replace {USERNAME} with your AD-account as well as some other {XYZ} (e.g. directories) according to your naming preferences. Any ssh or rsync call will ask for your AD password. The first time you log into some server you have to confirm it's authenticity (ECDSA key fingerprint) by tiping yes. Don't forget to close your ssh connections once you are done (via exit) or it is necessary to switch the server.
+
+You can connect to the worker node by using ssh {USERNAME}@odcf-worker01.
+
+Code and dataset location setup
+Remember the folder policies described above when setting up your experiments.
+
+Virtual environment setup
+You can create your virtual environment in you home directory.
+
+In the next steps we will use it to log in and set everything up (you may be still connected if you have just done the previous step).
+
+ssh {USERNAME}@odcf-worker01.dkfz.de
+Recall that we need to load python via the module command to be able to use virtualenv. Then we can create and source your virtual environment.
+
+module load Python/3.10.8-GCCcore-14.1.0
+virtualenv -p python3 {YOUR_ENV}
+source {YOUR_ENV}/bin/activate
+If you have a requirements.txt file from your project (create locally via pip freeze > requirements.txt) you can copy it to the worker and quickly install everything there as well e.g. via nano requirements.txt, pasting from your local file and saving the file (CTRL+O and CTRL+X), afterwards install via pip install -r requirements.txt. Alternatively specify your packages individually. Don't forget to create/expand your README on the environment and its purpose!
+
+nano README.txt
+Bash resource setup (.bashrc)
+As mentioned in the Software paragraph we have to create an appropriate .bashrc file. This file will be executed before any of your jobs start and can therefore be used to ensure that all necessary software is loaded and environment variables are set for your code to run.
+
+Since we do this again from the odcf-worker01 you might continue if still connected after the previous section. Now we create the file in your home directory.
+
+cd ~
+nano .bashrc
+The following is a template for this file. Be aware to adapt where necessary! You may also adapt to your needs (e.g. another CUDA version).
+
+bashrc.template
+# change username, dataset location and virtualenv according to experiment
+ 
+export PATH=/bin:$PATH
+export OMP_NUM_THREADS=1 # needed to be able to run batchgenerators with new numpy versions. Use this!
+ 
+module load python/3.7.0 # load python module. If you don't do this then you have no python
+ 
+source /dkfz/cluster/virtualenvs/{USERNAME}/{YOUR_ENV}/bin/activate # activate my python virtual environment
+# or, if you do not use a shared virtualenv:
+# source /home/{PATH_TO_ENV}/bin/activate
+# this part only makes sense if you have one virtual environment for all your experiments. If you have multiple, please see the runner script section below
+ 
+CUDA=10.2 # or 11.0
+export PATH=/usr/local/lib:$PATH
+export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
+export CPATH=/usr/local/lib:$CPATH
+export PATH=/usr/local/cuda-${CUDA}/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-${CUDA}/lib64:$LD_LIBRARY_PATH
+export CUDA_HOME=/usr/local/cuda-${CUDA}
+export CUDA_CACHE_DISABLE=1
+ 
+export DATASET_LOCATION=/dkfz/cluster/gpu/data/{DEPARTMENT-OE}/{USERNAME}/{YOUR_DATA_DIR}
+export EXPERIMENT_LOCATION=/dkfz/cluster/gpu/checkpoints/{DEPARTMENT-OE}/{USERNAME}/{EXP_RESULTS}
+Save and exit the editor. It is loadable everywhere via source /home/{USERNAME}/.bashrc.
+
+Signals and Checkpointing
+Due to the queues wall times you might need checkpointing and signals. LSF will send you a signal 1 hour before reaching the run time limit and one at termination.
+
+SIGUSR1 as a warning 1 hour before and SIGUSR2 with imminent termination. Using these signals could look like this:
+
+Python:
+
+import signal
+ 
+# Define signal handlers
+def handle_sigusr1(signum, frame):
+    print("[PYTHON JOB] Received SIGUSR1 (suspend). Performing checkpointing...")
+ 
+def handle_sigusr2(signum, frame):
+    print("[PYTHON JOB] Received SIGUSR2 (termination). Cleaning up and exiting...")
+ 
+# Register handlers
+signal.signal(signal.SIGUSR1, handle_sigusr1)
+signal.signal(signal.SIGUSR2, handle_sigusr2)
+ 
+def main():
+    # main function
+Bash:
+
+#!/bin/bash
+ 
+trap 'echo "[JOB] Received SIGUSR1 (1 hour warning), checkpointing..."; touch checkpoint.txt' SIGUSR1
+ 
+trap 'echo "[JOB] Received SIGUSR2 (termination), cleaning up..."; exit 0' SIGUSR2
+ 
+echo "[JOB] Starting job with PID $$"
+while true; do
+    echo "[JOB] Running..."
+    sleep 10
+done
+Runner script setup (optional)
+Most jobs do not need a runner script.
+
+Runner scripts are not needed when:
+
+Your job is just a single command that needs to be executed
+Your job uses a standard virtual environment and only the environment variables defined in your .bashrc.
+Runner scripts are useful when:
+
+Your job needs to execute a series of commands rather than just a single one
+Your job requires a specific setup:
+load a specific virtual environment
+set some specific environment variable
+requires some additional environment variables that you don't want to set in the .bashrc
+…
+If you need a runner script, this section is for you.
+
+Setting up the runner script should also be done from odcf-worker01. The runner script is essentially a bash script that executes a series of commands if executed as a job. Anything you want can be in there. Typically, the runner script has multiple purposes: It ensures that the .bashrc file is loaded properly prior to our experiment. Afterwards it presents our python script the correct location of the data (via environment variables), starts our main python script and starts auxiliary scripts. Make sure to adapt the template below according to your needs.
+
+cd ~
+nano runner_script.sh
+template_runner_script.sh
+#!/bin/bash
+ 
+# load default .bashrc. This is never loaded automatically
+source /home/{USERNAME}/.bashrc
+ 
+# overwrite existing environment variables or create new ones that are unique to your job
+export DATASET_LOCATION=XXX
+export EXPERIMENT_LOCATION=XXX
+ 
+# Execute the commands you need to run. You can pass through arguments with "$@"
+echo "$@"
+python3 script1.py $@
+python3 script2.py
+some_other_command
+Attention! Ensure your runner to be executable after saving!
+
+chmod +x runner_script.sh
+Now you can exit your ssh connection.
+
+Source code adaptation
+Your source code most probably receives some data and produces some output. If running on the GPU queue the paths to the corresponding directories changes. As we have included the export DATASET_LOCATION=XXX and export EXPERIMENT_LOCATION=XXX environment variables into the .bashrc or your runner script we can access these variables within our python script as follows.
+
+import os
+dataset_dir = os.environ['DATASET_LOCATION']
+exp_dir = os.environ['EXPERIMENT_LOCATION']
+It might be worth adding a parser and some –cluster argument to avoid changing your code everytime you switch between local experiments and ones on the cluster (see Python documentation). Or you just use the same environment variable names on your local machine as well (where they point to different folders).
+
+Daily routine with the cluster
+The daily routine encompasses the following possible steps:
+
+uploading or updating code
+uploading or updating data
+starting some experiment
+observing job and cluster status
+retrieving results
+In general most communication can be done either with rsync or by ssh on one of the hosts of the cluster.
+
+Pushing code to the cluster
+The preferred way of transferring code to the cluster is via git repositories. You can use all the regular git commands on the cluster. In case you cannot use git, rsync is a reasonable alternative for copying your code. Recall: These commands are always executed locally on the machine where you run them.
+
+rsync -rtvu --stats --exclude=venv --exclude=.git --exclude=imported_packages --exclude=__pycache__ --exclude=.idea /local/path/to/your/code/ {USERNAME}@odcf-worker01.dkfz.de:/home/{USERNAME}/{YOUR_CODE}
+For rsync arguments see e.g. here (german). You may adapt and or add --exclude={XYZ} to your experiment structure. Any time you want to update code on the cluster just call this command again.
+
+Pushing data to the cluster
+This is basically the same as pushing code to the cluster.
+
+rsync -rtvu --stats --exclude=custom_sets --exclude=toy /local/path/to/your/data/ {USERNAME}@odcf-worker01:/dkfz/cluster/gpu/data/{DEPARTMENT-OE}/{USERNAME}/{YOUR_DATA_DIR}/
+rsync is the fastest and most convenient way to do file transfers!
+
+Starting a job
+Attention prior starting a job make sure your code runs smoothly on your local machine! Also make sure its necessary ressources are according to the usage policy
+
+Before the actual submission, familiarize yourself with the following concepts.
+
+GPU allocation
+Based on our previous experience, what GPU a user needs is mostly determined by the amount of video memory available per GPU. Thus, GPU allocation is most easily determined by how much VRAM a job needs. There are other ways to specify what GPU you want, read man bsub for that.
+
+You will always get the 'smallest' GPU that fulfills your requirements. If you request 10.7G of gmem then your jobs will first be allocated to the RTX2080ti GPUs. Once these are all occupied your jobs will flow over to the 11.9G TitanX GPUs, then V100 15.7G, then Titan RTX with 23.6G, then V100 31.7G and finally 36G to adress A100 GPU nodes.
+
+Be honest with the amount of GPU memory you need! The RTX2080ti is not that much slower than the V100 for most workflows. You gain nothing being dishonest but you impede others.
+
+Please do NOT set your required gmem to 40G. Your jobs will be stuck in PEND state.
+
+Submitting to GPU Hostgroups
+With the option -m hostgroup you can submit to a special group of GPU nodes. For example if you prefer V100/32GB GPUs with SXM2 for your multi gpu training than write -m gpu-v100-32gb-SXM2
+
+Available groups are: gpu-rtx2080ti-11gb, gpu-titanxp-12gb, gpu-v100-16gb, gpu-v100-32gb-SXM2, gpu-v100-32gb-PCIe, gpu-titanrtx-24gb, gpu-quadrortx-24gb, gpu-v100-16gb-dgx1, gpu-v100-32gb-dgx2, gpu-a100-40gb
+
+Using Tensorflow
+Please be aware, Tensorflow uses more CPUs in our cluster than it should. That is because it just determines the total number of CPUs in the cluster node and believes it is o kay to take all of them. Since more then one job is running on the same node, this is not OK. Please use the information from this link to make tensorflow use less CPUs. 8-10 CPUs is the maximum you can use per Job (It does not have to be just 1 like in the link)! Reduce CPU cores used by tensorflow
+
+How can I use FP16 training?
+Automated Mixed precision, also called AMP, is a technique that can substantially increase (as in double!) the speed of your trainings. Essentially, the precision of all GEMMs (=convolutions) is reduced internally to fp16 (at no cost in model accuracy - there is no downside to using it!) which allows these operations to be performed on tensor cores. Tensor cores are dedicated parts in some GPUs that are optimized for these operations on a hardware level.
+
+This section used to contain a guide for how to set up Nvidia Apex for mixed precision training in pytorch. This is no longer necessary because pytorch now has native mixed precision support. Pytorchs implementation is much cleaner and easier to use while delivering the same performance (as in speed) improvements! Please follow the official examples.
+
+To make use of AMP, the GPU your job runs on needs to have tensor cores. To prevent you from having to learn by heart which GPUs in our cluster fulfill that requirement we have created the tensorcore resource. When submitting jobs, simply specify it like this to ensure that an appropriate GPU is selected by the scheduler:
+
+bsub -R "tensorcore" -gpu num=1:j_exclusive=yes:gmem=10G -q gpu MY_COMMAND
+Running AMP code on a GPU without tensorcores will still work, you will just not see a speed improvement.
+
+Running trainings with AMP enabled reduces the GPU memory requirements to 60-70% of the original value. This can be useful if your model is too large. This benefit also applies to GPUs without tensorcores.
+
+IMPORTANT: The current version of pytorch only uses cuDNN 7.6.5, With this older version, some GPUs do not support tensor core acceleration of 3D convolutions. 2D convolutions work on all GPUs (provided they have tensorcores). If you are using 3D convolutions, there are two options:
+
+you can specify the resource -R “tensorcore3d” instead. This will schedule your jobs on Volta GPUs where 3D convolutions are supported
+(recommended) you can download cuDNN 8.0.2 or newer and compile pytorch yourself. This will unlock all GPUs for 3D convolution acceleration. This will also generally increase your training speeds because there are many more optimizations in the newer cuDNN versions. Pytorch Compile Tutorial (contact Fabian Isensee in the meantime).
+Queues
+There are five possible queues to submit your job to. -q gpu is the default queue. You can use -q gpu-interactive and -q gpu-jupyter for testing things as these queues are interactive queues and will adress gpu-rtx2080ti-11gb nodes. Low priority jobs can be submitted to gpu-lowprio. When launching a large number of jobs, please use the gpu-lowprio queue so that other cluster users do not have to wait too long until their jobs are started. gpu and gpu-lowprio share the same GPUs/compute nodes. gpu-pro queues will have gpu-a100-40gb and future nodes exclusively
+
+Submission Examples
+Never start any training or other compute-heavy application from an ssh session! Always use bsub! Jobs should be submitted from bsub01.lsf.dkfz.de (connect via ssh as above). Let's make a small example: My program my_scipt.py needs one GPU with 11 GB of memory to run and usually was started on my local machine with:
+
+python3 my_script.py argument1 argument2 argument3 -kwarg1 abc
+Example with a runner script:
+
+bsub -gpu num=1:j_exclusive=yes:gmem=10.7G -q gpu /bin/bash -l -c "./my_runner_script.sh my_script.py argument1 argument2 argument3 -kwarg1 abc"
+Example without a runner script:
+
+bsub -gpu num=1:j_exclusive=yes:gmem=10.7G -q gpu /bin/bash -l -c "source ~/.bashrc && python3 my_script.py argument1 argument2 argument3 -kwarg1 abc"
+Note how we needed to preceed the Python call with a source ~/.bashrc statement. The .bashrc is never loaded automatically.
+
+Hereby:
+
+bsub is the command to submit jobs to the cluster
+-gpu followed by some properties specifies what GPU you need
+num: number of GPUs, leave that at one unless you know exactly what you are doing. Requesting more GPUs and not using them is not nice and will be noticed.
+j_exclusive set this to yes. This means that your job requests an exclusive GPU (no other job can use that same GPU). This is mandatory!
+gmem=10.7G This will determine what GPU you will get (based in GPU memory required (11G=11GB)). Please be honest here! I added a separate section about how GPUs are assigned to jobs. Please go read it! The lower this number is, the higher the chance your job starts soon! If you do not know how much memory a specific GPU has, have a look at lsload -gpuload
+-q gpu this specifies that your job is to be submitted to the queue gpu. This is required if you need a GPU
+/bin/bash -l -c sets the login shell to bash. This is necessary to run on Debian and DGXA100 nodes.
+for more documentation, see man bsub
+Here are some more examples. These vary in the requested GPU resources to illustrate how you are supposed to select GPUs.
+
+Specific GPU type can be defined via gmodel. Use the name of the GPU as displayed by lsload -gpuload -w, for example:
+
+bsub -gpu num=1:j_exclusive=yes:gmodel=GeForceRTX2080Ti -q gpu /bin/bash -l -c "source ~/.bashrc && python3 my_script.py argument1 argument2 argument3 -kwarg1 abc"
+If you use gmodel it makes sense to drop the gmem=10.7G part (otherwise you job may not start because these options can conflict, for example when you request too much memory)
+
+Multiple GPUs. The following command requests two 2080 ti GPUs. Note that gmem always refers to the GPU memory of the individual GPUs. You can only request as many GPUs as we have installed in an individual node. There are for example only nodes with two 2080ti, so requesting three will not work.
+
+bsub -gpu num=2:j_exclusive=yes:gmem=10.7G -q gpu /bin/bash -l -c "source ~/.bashrc && python3 my_script.py argument1 argument2 argument3 -kwarg1 abc"
+There are further interesting options with the bsub command. E.g. -u “{YOUR_MAIL}@dkfz-heidelberg.de” -B -N automatically sends you mails in case your jobs started respectively ended.
+
+Observing job and cluster status
+There are three common cases in which you might want to get detailed status information.
+
+to know how many jobs are running and or queued call bjobs -w -u all -q gpu from the submit host
+to know the load of the nodes and see how many (and which) nodes are utilised call lsload -gpuload from the submit host
+Please use https://gpu-monitor.lsf.dkfz.de/ monitor your GPU utilization
+Retrieving results
+This is done via rsync again. Prepare some local folder where you want to receive results at. Then call
+
+rsync -rtvu --stats {USERNAME}@odcf-worker01:/dkfz/cluster/gpu/checkpoints/{DEPARTMENT-OE}/{USERNAME}/{YOUR_DATA_DIR}/{EXP_RESULTS}/ /local/path/to/results/folder 
+Don't forget to remove old stuff from /dkfz/cluster/gpu/data and /dkfz/cluster/gpu/checkpoints as soon as you don't need the results or data anymore.
+
+Using Docker
+Docker2Singularity
+
+A quick way to convert your docker into a singularity container. This is necessary to run it on the DKFZ cluster.
+
+Prerequisites
+Usage
+To convert a docker into a singularity container please run:
+
+./docker2singularity.sh DOCKER_NAME [DOCKER_TAG="latest"]
+Example
+In the example you will build a DOcker container that:
+
+has a installed version of pytorch
+puts a copy from an image to your home directory (~/test_copy.png)
+puts a tensor on the GPU
+prints all steps
+The example dockerfile in the main folder could also be a template for transfering your own code into a docker. You just need to add your own dependencies in the dockerfile with RUN pip install ... or additional hardware packages with RUN apt install ....
+
+IMPORTANT NOTE!
+
+Please note that Singularity has direct access to all your files, while you have to explicitly mount folders in Docker to be able to access them. Thus, if you run the docker container with docker run ..., you won't find the copied file in your home directory. To find the copied file, you need to run the Singularity container as described.
+
+# get repository
+git clone https://phabricator.mitk.org/source/docker2singularity.git
+ 
+# go to directory
+cd docker2singularity
+ 
+# build example docker
+docker build . -t example_docker2singularity
+ 
+# convert docker to singularity container
+./docker2singularity example_docker2singularity
+ 
+# run singularity container
+singularity exec --nv example_docker2singularity.simg /workspace/start.sh
+Run on the cluster
+Please note:
+
+Singularity has direct write/read access to your file system. Thus, you don't need to mount anything into your container
+If you want to have access to the GPU ressources, it is important that you are using Singularity in the exec mode! Automatically started scripts by the container itself won't have access to the GPUs! Always use a start.sh script as you can see in the example
+Submit to the job queue by using the singularity command.
+Example job submission:
+
+bsub -gpu num=1:j_exclusive=yes:gmem=10.7G -q gpu 'singularity exec --nv [PATH_SINGULARITY_FILE].simg /[PATH_IN_DOCKER]/start.sh'
+GPU queue nodes
+This summary is intended to provide an overview over all the different GPU nodes that are in the cluster.
+
+Name	CPU	RAM	GPU
+gpu and gpu-lowprio Hosts
+e071-gpu01	* 2 x Xeon(R) Gold 6126 CPU @ 2.60GHz with 12 Cores for a total of 24C/48T	* 256 GB RAM	* 4 x Tesla V100-SXM2-16GB
+e071-gpu[03-07]	* 2 x Xeon(R) Gold 5118 CPU @ 2.30GHz with 12 Cores for a total of 24C/48T	* 252 GB RAM	* 4 x Tesla V100 PCIE 32GB
+hdf18-gpu[01-20]	* 2 x E5-2620 v4 @ 2.10GHz with 8 Cores for a total of 16C/32T	* 188 GB RAM	* 2 x Nvidia RTX 2080 10.7G
+hdf19-gpu[01-10] and hdf19-gpu[21-22]	* 2 x Xeon(R) Gold 6126 CPU @ 2.60GHz with 12 Cores for a total of 24C/48T	* 384 GB RAM	* 4 x Titan RTX 23.6G
+hdf19-gpu[11-15] and hdf19-gpu20	* 2 x Xeon(R) Gold 6126 CPU @ 2.60GHz with 12 Cores for a total of 24C/48T	* 384 GB RAM	* 4 x V100-SXM2 32 GB
+hdf19-gpu16	* 1 x AMD EPYC 7502P @ 2.50GHz with 32 Cores	* 256 GB RAM	* 4 x Quadro RTX 6000 23.6G
+hdf19-gpu[17-19]	* 2 x Xeon(R) Gold 6226R CPU @ 2.90GHz with 16 Cores for a total of 32C/64T	* 376 GB RAM	* 4 x V100-SXM2 32G
+e230-dgx1-1	* 2 x Xeon(R) CPU E5-2698 v4 @ 2.20GHz with 20C for a total of 40C/80T	* 500 GB RAM	* 8 x V100-SXM2 15.7GB
+e230-dgx2-[1-2]	* 2 x Xeon(R) Platinum 8168 CPU @ 2.70GHz with 24C for a total of 48C/96T	* 1.5 TB RAM	* 16 x V100-SXM2 31.7G
+GPU-PRO Hosts
+e230-dgxa100-[1-4]	* 2 x AMD EPYC 7742 64-Core Processor	* 1 TB RAM	* 8 x A100-SXM4 40GB
+lsf22-gpu[01-08]	* 2 x AMD EPYC 7763 64-Core Processor	* 1 TB RAM	* 8 x A100-PCI 40GB
+e230-thinka100-[01-02]	* 2 x Xeon(R) Gold 6330 CPU @ 2.00GHz with 28C for a total of 56C/112T	* 1 TB RAM	* 4 x A100-SXM4 40GB
+AIH-SuperL40s-[01-07]	* 2 x AMD EPYC 9554 CPU @ 2.25GHz with 64C for a total of 128C/256T	* 1,1 TB RAM	* 8 x L40s-PCI 46GB
+FSE-SuperL40s-[01-02]	* 2 x AMD EPYC 9554 CPU @ 2.25GHz with 64C for a total of 128C/256T	* 1,1 TB RAM	* 8 x L40s-PCI 46GB
+NCT-SuperH200-01	* 2 x AMD EPYC 9754 CPU @ 2.25GHz with 128C for a total of 256C/512T	* 1,5 TB RAM	* 8 x H200-SXM5 141GB
+B260-SuperH200-01	* 2 x AMD EPYC 9754 CPU @ 2.25GHz with 128C for a total of 256C/512T	* 1,5 TB RAM	* 8 x H200-SXM5 141GB
+E230-SuperH200-01	* 2 x AMD EPYC 9754 CPU @ 2.25GHz with 128C for a total of 256C/512T	* 1,5 TB RAM	* 8 x H200-SXM5 141GB
+COMING SOON
+C140-thinka100-[01-02]	* 2 x Xeon(R) Gold 6330 CPU @ 2.00GHz with 28C for a total of 56C/112T	* 1 TB RAM	* 4 x A100-SXM4 40GB
+— Initial authors: Fabian Isensee (E230, Medizinische Bildverarbeitung) and Melinda Mike (ITCF)
+
+This website uses cookies. By using the website, you agree with storing cookies on your computer. Also you acknowledge that you have read and understand our Privacy Policy. If you do not agree leave the website.More information about cookies
+Site Tools
+Recent Changes
+Media Manager
+Sitemap
+Page Tools
+Old revisions
+Backlinks
+Manage Subscriptions
+Copy this page
+Export to PDF
+Fold/unfold all
+Back to top
+User Tools
+Logged in as: Heidari, Elyas (e915i)
+Update Profile
+Log Out
+pub/cluster/lsf/gpu/start.txt · Last modified: 2025/08/07 19:29 by Thommen, Frank
+ ODCF Wiki
+Search
+DKFZ CLUSTER WIKI
+
+Cluster Quickstart
+LSF Job Scheduling
+Quick Reference
+How To...
+Troubleshooting
+User Meetings
+Running Container Jobs on the Cluster
+GPU Queues
+Introduction
+GPU-Policies
+Prerequisites
+Initial Setup of your cluster code infrastructure
+Daily routine with the cluster
+GPU queue nodes
+GPU Usage Rules
+Pytorch Compile Tutorial
+GPU Queue Nodes
+GPU Node Investments
+General Usage
+DATA ANALYSIS AND DEVELOPMENT
+
+KNOWLEDGEBASE
+
+ODCF BIOINFORMATICS
+
+CONTACT
+
+Imprint -- Data Privacy Protection -- Contact
+

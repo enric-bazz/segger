@@ -244,7 +244,7 @@ class ISTSegmentationWriter(BasePredictionWriter):
 
         # Apply fragment mode if enabled
         if self.fragment_mode:
-            output = self._apply_fragment_mode(output, trainer)
+            output = self._apply_fragment_mode(output, trainer, pl_module)
 
         # Write output to file
         output.write_parquet(self.output_directory / 'segger_segmentation.parquet')
@@ -253,6 +253,7 @@ class ISTSegmentationWriter(BasePredictionWriter):
         self,
         segmentation_df: pl.DataFrame,
         trainer: Trainer,
+        pl_module: LightningModule,
     ) -> pl.DataFrame:
         """Apply fragment mode to group unassigned transcripts.
 
@@ -266,6 +267,9 @@ class ISTSegmentationWriter(BasePredictionWriter):
             Segmentation results with cell assignments.
         trainer : Trainer
             PyTorch Lightning trainer with access to datamodule.
+        pl_module : LightningModule
+            Active model used for prediction. When available, learned gene
+            embedding weights are used for tx-tx similarities.
 
         Returns
         -------
@@ -304,9 +308,23 @@ class ISTSegmentationWriter(BasePredictionWriter):
                 flush=True,
             )
 
-        # Check if we have gene embeddings for post-hoc similarity computation
-        has_gene_embeddings = (
-            hasattr(datamodule, 'ad') and 'X_corr' in datamodule.ad.varm
+        # Resolve embedding sources in priority order:
+        # 1) learned model embeddings, 2) X_corr fallback.
+        learned_gene_embeddings = None
+        model = getattr(pl_module, "model", None)
+        lin_first = getattr(model, "lin_first", None)
+        if lin_first is not None:
+            try:
+                tx_embed_layer = lin_first["tx"]
+                if hasattr(tx_embed_layer, "weight") and tx_embed_layer.weight is not None:
+                    learned_gene_embeddings = tx_embed_layer.weight.detach()
+            except Exception:
+                learned_gene_embeddings = None
+
+        has_xcorr_embeddings = (
+            hasattr(datamodule, "ad")
+            and hasattr(datamodule.ad, "varm")
+            and "X_corr" in datamodule.ad.varm
         )
 
         # Collect tx-tx edges from the base HeteroData (not tiles)
@@ -363,20 +381,28 @@ class ISTSegmentationWriter(BasePredictionWriter):
                 flush=True,
             )
 
-        # Get similarities - either from stored edge_attr or compute post-hoc.
-        if hasattr(tx_tx_store, 'edge_attr') and tx_tx_store.edge_attr is not None:
-            similarities = tx_tx_store.edge_attr.detach().reshape(-1)
-            if similarities.device != device:
-                similarities = similarities.to(device)
-            candidate_similarities = similarities[candidate_edge_indices]
-        elif has_gene_embeddings:
-            # Compute similarities post-hoc in chunks to avoid materializing
-            # per-edge embeddings for the whole graph at once.
-            gene_embeddings = torch.tensor(
-                datamodule.ad.varm['X_corr'],
+        # Compute similarities from embeddings when available:
+        # learned model embeddings first, then X_corr fallback.
+        similarity_source = None
+        if learned_gene_embeddings is not None:
+            gene_embeddings = learned_gene_embeddings
+            if gene_embeddings.device != device:
+                gene_embeddings = gene_embeddings.to(device)
+            gene_embeddings = gene_embeddings.to(dtype=torch.float32)
+            similarity_source = "learned_gene_embedding"
+        elif has_xcorr_embeddings:
+            gene_embeddings = torch.as_tensor(
+                datamodule.ad.varm["X_corr"],
                 dtype=torch.float32,
                 device=device,
             )
+            similarity_source = "x_corr"
+        else:
+            gene_embeddings = None
+
+        if gene_embeddings is not None:
+            # Compute similarities post-hoc in chunks to avoid materializing
+            # per-edge embeddings for the whole graph at once.
             gene_indices = base_data['tx']['x']
             if gene_indices.device != device:
                 gene_indices = gene_indices.to(device)
@@ -443,6 +469,19 @@ class ISTSegmentationWriter(BasePredictionWriter):
                     dst_emb,
                     dim=-1,
                 )
+            if debug_fragment:
+                print(
+                    f"[segger][fragment] similarity source: {similarity_source}",
+                    flush=True,
+                )
+        elif hasattr(tx_tx_store, 'edge_attr') and tx_tx_store.edge_attr is not None:
+            # Compatibility fallback for precomputed edge similarities.
+            similarities = tx_tx_store.edge_attr.detach().reshape(-1)
+            if similarities.device != device:
+                similarities = similarities.to(device)
+            candidate_similarities = similarities[candidate_edge_indices]
+            if debug_fragment:
+                print("[segger][fragment] similarity source: edge_attr", flush=True)
         else:
             # No way to compute similarities
             if debug_fragment:

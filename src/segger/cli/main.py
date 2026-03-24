@@ -492,6 +492,11 @@ def segment(
         validator=validators.Number(gt=0),
         group=group_prediction,
     )] = 5,
+    min_fragment_size: Annotated[int | None, Parameter(
+        help="Deprecated alias for --fragment-min-transcripts.",
+        validator=validators.Number(gt=0),
+        group=group_prediction,
+    )] = None,
 
     fragment_similarity_threshold: Annotated[float | None, Parameter(
         help="Similarity threshold for tx-tx edges in fragment mode. "
@@ -517,6 +522,17 @@ def segment(
     ] = "false",
 ):
     """Run cell segmentation on spatial transcriptomics data."""
+    if min_fragment_size is not None:
+        if (
+            fragment_min_transcripts != 5
+            and fragment_min_transcripts != min_fragment_size
+        ):
+            raise ValueError(
+                "Conflicting fragment size values: "
+                "--fragment-min-transcripts and --min-fragment-size differ."
+            )
+        fragment_min_transcripts = min_fragment_size
+
     # Resolve tissue_type → scrna_reference_path
     if tissue_type and scrna_reference_path:
         raise ValueError(
@@ -681,6 +697,11 @@ def predict(
         validator=validators.Number(gt=0),
         group=group_prediction,
     )] = 5,
+    min_fragment_size: Annotated[int | None, Parameter(
+        help="Deprecated alias for --fragment-min-transcripts.",
+        validator=validators.Number(gt=0),
+        group=group_prediction,
+    )] = None,
     fragment_similarity_threshold: Annotated[float | None, Parameter(
         help="Similarity threshold for tx-tx edges in fragment mode. "
              "If None, uses Li+Yen auto-thresholding on candidate unassigned tx-tx edges.",
@@ -701,6 +722,17 @@ def predict(
     ] = "checkpoint",
 ):
     """Run prediction-only segmentation from a checkpoint."""
+    if min_fragment_size is not None:
+        if (
+            fragment_min_transcripts != 5
+            and fragment_min_transcripts != min_fragment_size
+        ):
+            raise ValueError(
+                "Conflicting fragment size values: "
+                "--fragment-min-transcripts and --min-fragment-size differ."
+            )
+        fragment_min_transcripts = min_fragment_size
+
     from dataclasses import fields as dataclass_fields
     from lightning.pytorch.plugins.environments import SLURMEnvironment
     from lightning.pytorch import Trainer
@@ -1960,6 +1992,10 @@ def fetch(
              "in current working directory (or $SEGGER_REFERENCE_CACHE_DIR).",
         group=group_atlas,
     )] = None,
+    force: Annotated[bool, Parameter(
+        help="Force re-download even if a cached reference already exists.",
+        group=group_atlas,
+    )] = False,
 ):
     """Fetch a tissue-specific scRNA-seq reference from CellxGENE Census."""
     from ..data.atlas import fetch_reference
@@ -1976,6 +2012,7 @@ def fetch(
         drop_unknown_cell_types=True,
         drop_other_cell_types=True,
         progress=True,
+        force=force,
     )
     print(f"Tissue:       {ref.tissue}")
     print(f"Organism:     {ref.organism}")

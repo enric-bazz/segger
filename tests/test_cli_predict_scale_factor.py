@@ -139,3 +139,23 @@ def test_predict_allows_prediction_scale_override_and_preserves_fragment_options
     assert writer_kwargs["fragment_similarity_threshold"] == 0.6
     assert writer_kwargs["min_similarity"] == 0.25
     assert writer_kwargs["min_similarity_shift"] == 0.1
+
+
+def test_predict_accepts_legacy_min_fragment_size_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _install_fake_predict_runtime(
+        monkeypatch,
+        {"prediction_graph_scale_factor": 2.2, "use_3d": False},
+    )
+
+    cli_main.predict(
+        checkpoint_path=tmp_path / "model.ckpt",
+        input_directory=tmp_path / "input",
+        output_directory=tmp_path / "output",
+        min_fragment_size=9,
+    )
+
+    writer_kwargs = captured["writer"]
+    assert writer_kwargs["fragment_min_transcripts"] == 9

@@ -14,6 +14,7 @@ Options:
   --out-tsv <file>   Snapshot TSV output path
                      (default: <root>/summaries/status_snapshot.tsv)
   --watch [sec]      Refresh dashboard every N seconds (default: 20)
+  --minimal          Minimal terminal output with compact jobs overview
   --no-color         Disable ANSI colors
   -h, --help         Show this help
 EOF
@@ -23,6 +24,7 @@ ROOT="./results/mossi_main_big_benchmark_nightly"
 OUT_TSV=""
 OUT_TSV_SET=0
 WATCH_SEC=0
+MINIMAL_MODE=0
 NO_COLOR=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -54,6 +56,10 @@ while [[ $# -gt 0 ]]; do
         shift
       fi
       ;;
+    --minimal)
+      MINIMAL_MODE=1
+      shift
+      ;;
     --no-color)
       NO_COLOR=1
       shift
@@ -84,7 +90,10 @@ SUMMARY_DIR="${ROOT}/summaries"
 LOGS_DIR="${ROOT}/logs"
 RUNS_DIR="${ROOT}/runs"
 EXPORTS_DIR="${ROOT}/exports"
-VALIDATION_TSV="${SUMMARY_DIR}/validation_metrics.tsv"
+VALIDATION_TSV="${SUMMARY_DIR}/validation_metrics_.tsv"
+if [[ ! -f "${VALIDATION_TSV}" ]] && [[ -f "${SUMMARY_DIR}/validation_metrics.tsv" ]]; then
+  VALIDATION_TSV="${SUMMARY_DIR}/validation_metrics.tsv"
+fi
 if [[ ! -f "${VALIDATION_TSV}" ]] && [[ -f "${ROOT}/validation_metrics.tsv" ]]; then
   VALIDATION_TSV="${ROOT}/validation_metrics.tsv"
 fi
@@ -106,6 +115,9 @@ if [[ ! -f "${PLAN_FILE}" ]]; then
     fi
     if [[ "${WATCH_SEC}" -gt 0 ]]; then
       cmd+=(--watch "${WATCH_SEC}")
+    fi
+    if [[ "${MINIMAL_MODE}" == "1" ]]; then
+      cmd+=(--minimal)
     fi
     if [[ "${NO_COLOR}" == "1" ]]; then
       cmd+=(--no-color)
@@ -464,6 +476,29 @@ read_export_stage_note() {
   read_stage_field "${seg_dir}/.export_status" "export_note"
 }
 
+read_segment_stage_max_vram_mb() {
+  local seg_dir="$1"
+  read_stage_field "${seg_dir}/.segment_status" "max_vram_mb"
+}
+
+read_segment_stage_max_vram_gb() {
+  local seg_dir="$1"
+  read_stage_field "${seg_dir}/.segment_status" "max_vram_gb"
+}
+
+read_note_field() {
+  local note_text="$1"
+  local key="$2"
+  local token
+  for token in ${note_text}; do
+    if [[ "${token}" == "${key}="* ]]; then
+      printf '%s' "${token#*=}"
+      return 0
+    fi
+  done
+  return 0
+}
+
 get_validation_status_for_job() {
   local job="$1"
   if [[ ! -f "${VALIDATION_TSV}" ]]; then
@@ -560,7 +595,7 @@ build_snapshot() {
   fi
   collect_lsf_state_map "${status_map}" "${lsf_state_map}"
 
-  printf "job\tgroup\tgpu\tstatus\tstate\trunning\telapsed_s\trun_count\thad_rerun\thad_anc_retry\thad_predict_fallback\thad_recovery_pass\tseg_exists\tanndata_exists\txenium_exists\tseg_dir\tlog_file\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\tsegment_status\texport_status\tsegment_job_id\texport_job_id\texport_note\tnote\n" > "${tmp_file}"
+  printf "job\tgroup\tgpu\tstatus\tstate\trunning\telapsed_s\trun_count\thad_rerun\thad_anc_retry\thad_predict_fallback\thad_recovery_pass\tseg_exists\tanndata_exists\txenium_exists\tseg_dir\tlog_file\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\tsegment_status\texport_status\tsegment_job_id\texport_job_id\texport_note\tnote\trequested_queue\trequested_gmem_gb\trequested_mem_gb\trequested_wall\tmax_vram_mb\tmax_vram_gb\n" > "${tmp_file}"
 
   tail -n +2 "${PLAN_FILE}" | while IFS=$'\t' read -r -a cols; do
     local job group use_3d expansion tx_max_k tx_max_dist n_mid_layers n_heads cells_min_counts min_qv alignment_loss
@@ -570,6 +605,8 @@ build_snapshot() {
     local run_count had_rerun had_anc_retry had_predict_fallback had_recovery_pass
     local state validate_status lsf_job_id lsf_state export_rc
     local stage_segment_status stage_export_status stage_export_note
+    local requested_queue requested_gmem_gb requested_mem_gb requested_wall
+    local stage_max_vram_mb stage_max_vram_gb
 
     if [[ "${plan_has_study_block}" == "1" ]]; then
       job="${cols[0]-}"
@@ -666,9 +703,26 @@ build_snapshot() {
     stage_segment_status="$(read_segment_stage_status "${seg_dir}")"
     stage_export_status="$(read_export_stage_status "${seg_dir}")"
     stage_export_note="$(read_export_stage_note "${seg_dir}")"
+    stage_max_vram_mb="$(read_segment_stage_max_vram_mb "${seg_dir}")"
+    stage_max_vram_gb="$(read_segment_stage_max_vram_gb "${seg_dir}")"
     [[ -n "${stage_segment_status}" ]] || stage_segment_status="${row_segment_status}"
     [[ -n "${stage_export_status}" ]] || stage_export_status="${row_export_status}"
     [[ -n "${stage_export_note}" ]] || stage_export_note="${row_export_note}"
+    if [[ -z "${stage_max_vram_gb}" && -n "${stage_max_vram_mb}" ]]; then
+      stage_max_vram_gb="$(awk -v mb="${stage_max_vram_mb}" 'BEGIN { printf "%.2f", (mb + 0.0) / 1024.0 }')"
+    fi
+    requested_queue="$(read_note_field "${note}" "queue")"
+    requested_gmem_gb="$(read_note_field "${note}" "gmem")"
+    requested_mem_gb="$(read_note_field "${note}" "mem")"
+    requested_wall="$(read_note_field "${note}" "wall")"
+    requested_gmem_gb="${requested_gmem_gb%G}"
+    requested_mem_gb="${requested_mem_gb%G}"
+    [[ -n "${requested_queue}" ]] || requested_queue="-"
+    [[ -n "${requested_gmem_gb}" ]] || requested_gmem_gb="-"
+    [[ -n "${requested_mem_gb}" ]] || requested_mem_gb="-"
+    [[ -n "${requested_wall}" ]] || requested_wall="-"
+    [[ -n "${stage_max_vram_mb}" ]] || stage_max_vram_mb="-"
+    [[ -n "${stage_max_vram_gb}" ]] || stage_max_vram_gb="-"
     [[ -n "${lsf_job_id}" ]] || lsf_job_id="${row_segment_job_id}"
     if [[ -n "${lsf_row}" ]]; then
       IFS=$'\t' read -r _ lsf_job_id lsf_state <<< "${lsf_row}"
@@ -757,7 +811,7 @@ build_snapshot() {
         fi
       fi
     fi
-    if [[ -n "${export_rc}" && "${export_rc}" != "0" ]] && [[ "${anndata_exists}" == "0" || "${xenium_exists}" == "0" ]]; then
+    if [[ "${seg_exists}" == "0" && -n "${export_rc}" && "${export_rc}" != "0" ]] && [[ "${anndata_exists}" == "0" || "${xenium_exists}" == "0" ]]; then
       state="failed"
       status="export_error"
     fi
@@ -810,34 +864,16 @@ build_snapshot() {
         status="${stage_segment_status}"
         ;;
       segment_ok|predict_ok)
-        case "${stage_export_status}" in
-          export_error)
-            state="failed"
-            status="export_error"
-            ;;
-          export_ok|export_skipped_xenium_missing_source|not_requested)
-            state="done"
-            if [[ -z "${validate_status}" || "${validate_status}" == "ok" ]]; then
-              status="ok"
-            elif [[ -n "${validate_status}" ]]; then
-              status="${validate_status}"
-            fi
-            ;;
-          planned|pending|running)
-            state="running"
-            status="running"
-            ;;
-          "")
-            if [[ "${seg_exists}" == "1" ]]; then
-              state="done"
-              if [[ -z "${validate_status}" || "${validate_status}" == "ok" ]]; then
-                status="ok"
-              elif [[ -n "${validate_status}" ]]; then
-                status="${validate_status}"
-              fi
-            fi
-            ;;
-        esac
+        state="done"
+        if [[ -z "${validate_status}" || "${validate_status}" == "ok" ]]; then
+          if [[ "${anndata_exists}" == "1" ]]; then
+            status="ok"
+          else
+            status="segment_only"
+          fi
+        elif [[ -n "${validate_status}" ]]; then
+          status="${validate_status}"
+        fi
         ;;
       running)
         state="running"
@@ -851,6 +887,25 @@ build_snapshot() {
         ;;
     esac
 
+    # Segmentation availability is the source of truth for completion.
+    if [[ "${seg_exists}" == "1" ]]; then
+      state="done"
+      running=0
+      if [[ -z "${validate_status}" || "${validate_status}" == "ok" ]]; then
+        if [[ "${anndata_exists}" == "1" ]]; then
+          status="ok"
+        else
+          status="segment_only"
+        fi
+      elif [[ -n "${validate_status}" ]]; then
+        status="${validate_status}"
+      fi
+      if [[ "${log_file}" == "${attempt_err_log}" || "${log_file}" == "${attempt_out_log}" ]]; then
+        log_file="$(pick_log_file "${job}")"
+        [[ -n "${log_file}" ]] || log_file="${LOGS_DIR}/${job}.gpu?.log"
+      fi
+    fi
+
     if [[ "${state}" == "failed" || "${state}" == "partial" ]]; then
       if [[ -n "${attempt_err_log}" ]]; then
         log_file="${attempt_err_log}"
@@ -859,13 +914,14 @@ build_snapshot() {
       fi
     fi
 
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
       "${job}" "${group}" "${gpu}" "${status}" "${state}" "${running}" "${elapsed}" \
       "${run_count}" "${had_rerun}" "${had_anc_retry}" "${had_predict_fallback}" "${had_recovery_pass}" \
       "${seg_exists}" "${anndata_exists}" "${xenium_exists}" "${seg_dir}" "${log_file}" \
       "${use_3d}" "${expansion}" "${tx_max_k}" "${tx_max_dist}" "${n_mid_layers}" "${n_heads}" \
       "${cells_min_counts}" "${min_qv}" "${alignment_loss}" \
       "${stage_segment_status}" "${stage_export_status}" "${row_segment_job_id}" "${row_export_job_id}" "${stage_export_note}" "${note}" \
+      "${requested_queue}" "${requested_gmem_gb}" "${requested_mem_gb}" "${requested_wall}" "${stage_max_vram_mb}" "${stage_max_vram_gb}" \
       >> "${tmp_file}"
   done
 
@@ -1160,21 +1216,43 @@ render_dashboard() {
       if (n < 0) n = 0
       return sprintf("%.2f", n)
     }
-    BEGIN {
-      print "rank\tjob\tgroup\tgpu\tstate\tstatus\truns\telapsed_min\trerun\tanc_retry\toom_pred_fallback\trecovery\tseg\tanndata\txenium"
+    function col(name, fallback) {
+      if ((name in idx) && idx[name] > 0 && idx[name] <= NF) return $(idx[name])
+      return fallback
+    }
+    NR == 1 {
+      for (i = 1; i <= NF; i++) idx[$i] = i
+      print "rank\tjob\tgroup\tgpu\tstate\tstatus\truns\telapsed_min\treq_gmem_gb\tmax_vram_gb\trerun\tanc_retry\toom_pred_fallback\trecovery\tseg\tanndata\txenium"
+      next
     }
     NR > 1 {
-      st = $5
+      st = col("state", "pending")
       if (st == "") st = "pending"
-      status = $4
+      status = col("status", "")
       if (status == "") status = "<none>"
-      print rank(st) "\t" $1 "\t" $2 "\t" $3 "\t" st "\t" status "\t" $8 "\t" fmt_minutes($7) "\t" $9 "\t" $10 "\t" $11 "\t" $12 "\t" $13 "\t" $14 "\t" $15
+      print rank(st) "\t" \
+            col("job", "-") "\t" \
+            col("group", "-") "\t" \
+            col("gpu", "-") "\t" \
+            st "\t" \
+            status "\t" \
+            col("run_count", "0") "\t" \
+            fmt_minutes(col("elapsed_s", "0")) "\t" \
+            col("requested_gmem_gb", "-") "\t" \
+            col("max_vram_gb", "-") "\t" \
+            col("had_rerun", "0") "\t" \
+            col("had_anc_retry", "0") "\t" \
+            col("had_predict_fallback", "0") "\t" \
+            col("had_recovery_pass", "0") "\t" \
+            col("seg_exists", "0") "\t" \
+            col("anndata_exists", "0") "\t" \
+            col("xenium_exists", "0")
     }
   ' "${snapshot}" \
     | {
         IFS= read -r header || true
         if [[ -n "${header}" ]]; then
-          printf "job\tgroup\tgpu\tstate\tstatus\truns\telapsed_min\trerun\tanc_retry\toom_pred_fallback\trecovery\tseg\tanndata\txenium\n"
+          printf "job\tgroup\tgpu\tstate\tstatus\truns\telapsed_min\treq_gmem_gb\tmax_vram_gb\trerun\tanc_retry\toom_pred_fallback\trecovery\tseg\tanndata\txenium\n"
         fi
         sort -t $'\t' -k1,1n -k2,2 \
           | cut -f2-
@@ -1253,7 +1331,7 @@ render_dashboard() {
     FNR == 1 {
       for (i = 1; i <= NF; i++) idx[$i] = i
       has_block = (("study_block" in idx) && idx["study_block"] > 0) ? 1 : 0
-      print "rank\tjob\tmodel\tstudy_block\tgroup\tstate\tstatus\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\tprediction_mode\tfragment_mode"
+      print "rank\tjob\tmodel\tstudy_block\tgroup\tstate\tstatus\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\tprediction_mode\tfragment_mode\tqueue\treq_gmem_gb\treq_mem_gb\treq_wall"
       next
     }
     {
@@ -1285,13 +1363,17 @@ render_dashboard() {
             col("min_qv", "-") "\t" \
             col("alignment_loss", "-") "\t" \
             col("prediction_mode", "-") "\t" \
-            col("fragment_mode", "-")
+            col("fragment_mode", "-") "\t" \
+            col("queue", "-") "\t" \
+            col("gmem_gb", "-") "\t" \
+            col("mem_gb", "-") "\t" \
+            col("wall_time", "-")
     }
   ' "${snapshot}" "${PLAN_FILE}" \
     | {
         IFS= read -r header || true
         if [[ -n "${header}" ]]; then
-          printf "job\tmodel\tstudy_block\tgroup\tstate\tstatus\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\tprediction_mode\tfragment_mode\n"
+          printf "job\tmodel\tstudy_block\tgroup\tstate\tstatus\tuse_3d\texpansion\ttx_max_k\ttx_max_dist\tn_mid_layers\tn_heads\tcells_min_counts\tmin_qv\talignment_loss\tprediction_mode\tfragment_mode\tqueue\treq_gmem_gb\treq_mem_gb\treq_wall\n"
         fi
         sort -t $'\t' -k1,1n -k2,2 \
           | cut -f2-
@@ -1725,6 +1807,104 @@ render_dashboard() {
   fi
 }
 
+render_minimal_dashboard() {
+  local snapshot="$1"
+  local total done_count running_count pending_count partial_count failed_count processed now
+  local jobs_overview_file done_jobs_file failed_jobs_file
+
+  total="$(awk 'END { print NR-1 }' "${snapshot}")"
+  done_count="$(awk -F'\t' 'NR>1 && $5=="done" {c++} END{print c+0}' "${snapshot}")"
+  running_count="$(awk -F'\t' 'NR>1 && $5=="running" {c++} END{print c+0}' "${snapshot}")"
+  pending_count="$(awk -F'\t' 'NR>1 && $5=="pending" {c++} END{print c+0}' "${snapshot}")"
+  partial_count="$(awk -F'\t' 'NR>1 && $5=="partial" {c++} END{print c+0}' "${snapshot}")"
+  failed_count="$(awk -F'\t' 'NR>1 && $5=="failed" {c++} END{print c+0}' "${snapshot}")"
+  processed=$((done_count + partial_count + failed_count))
+
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "${C_CYAN}Benchmark Dashboard (Minimal)${C_RESET} | ${now}"
+  echo "Root: ${ROOT}"
+  echo "Snapshot: ${snapshot}"
+  printf "Progress: "
+  draw_progress_bar "${processed}" "${total}"
+  echo
+  printf "%b\n" "${C_BLUE}running=${running_count}${C_RESET}  ${C_YELLOW}pending=${pending_count}${C_RESET}  ${C_RED}failed=${failed_count}${C_RESET}  ${C_GREEN}done=${done_count}${C_RESET}  ${C_CYAN}partial=${partial_count}${C_RESET}"
+
+  jobs_overview_file="$(mktemp)"
+  done_jobs_file="$(mktemp)"
+  failed_jobs_file="$(mktemp)"
+
+  awk -F'\t' '
+    function rank(st, lower) {
+      lower = tolower(st)
+      if (lower == "failed") return 1
+      if (lower == "running") return 2
+      if (lower == "partial") return 3
+      if (lower == "pending") return 4
+      if (lower == "done") return 5
+      if (lower == "reference") return 6
+      return 99
+    }
+    function fmt_minutes(v, lower, n) {
+      lower = tolower(v)
+      if (v == "" || lower == "nan" || lower == "none" || lower == "-") return "0.00"
+      n = (v + 0.0) / 60.0
+      if (n < 0) n = 0
+      return sprintf("%.2f", n)
+    }
+    function col(name, fallback) {
+      if ((name in idx) && idx[name] > 0 && idx[name] <= NF) return $(idx[name])
+      return fallback
+    }
+    function bool_label(v, lower) {
+      lower = tolower(v)
+      if (v == "1" || lower == "true" || lower == "yes") return "yes"
+      return "no"
+    }
+    NR == 1 {
+      for (i = 1; i <= NF; i++) idx[$i] = i
+      print "rank\tjob\tgroup\tstate\tstatus\truns\telapsed_min\treq_queue\treq_gmem_gb\tanndata\tmax_vram_gb"
+      next
+    }
+    NR > 1 {
+      st = col("state", "pending")
+      if (st == "") st = "pending"
+      status = col("status", "")
+      if (status == "") status = "<none>"
+      print rank(st) "\t" \
+            col("job", "-") "\t" \
+            col("group", "-") "\t" \
+            st "\t" \
+            status "\t" \
+            col("run_count", "0") "\t" \
+            fmt_minutes(col("elapsed_s", "0")) "\t" \
+            col("requested_queue", "-") "\t" \
+            col("requested_gmem_gb", "-") "\t" \
+            bool_label(col("anndata_exists", "0")) "\t" \
+            col("max_vram_gb", "-")
+    }
+  ' "${snapshot}" \
+    | {
+        IFS= read -r header || true
+        if [[ -n "${header}" ]]; then
+          printf "job\tgroup\tstate\tstatus\truns\telapsed_min\treq_queue\treq_gmem_gb\tanndata\tmax_vram_gb\n"
+        fi
+        sort -t $'\t' -k1,1n -k2,2 | cut -f2-
+      } > "${jobs_overview_file}"
+
+  awk -F'\t' 'NR == 1 || tolower($3) == "done" { print }' "${jobs_overview_file}" > "${done_jobs_file}"
+  awk -F'\t' 'NR == 1 || tolower($3) == "failed" { print }' "${jobs_overview_file}" > "${failed_jobs_file}"
+
+  echo
+  echo "Done Jobs:"
+  colorize_rows_by_state_column 3 < "${done_jobs_file}" | render_tsv_table
+
+  echo
+  echo "Failed Jobs:"
+  colorize_rows_by_state_column 3 < "${failed_jobs_file}" | render_tsv_table
+
+  rm -f "${jobs_overview_file}" "${done_jobs_file}" "${failed_jobs_file}"
+}
+
 snapshot_once() {
   local tmp_status_map tmp_running
   tmp_status_map="$(mktemp)"
@@ -1741,10 +1921,18 @@ if [[ "${WATCH_SEC}" -gt 0 ]]; then
     if [[ -t 1 ]]; then
       clear
     fi
-    render_dashboard "${OUT_TSV}"
+    if [[ "${MINIMAL_MODE}" == "1" ]]; then
+      render_minimal_dashboard "${OUT_TSV}"
+    else
+      render_dashboard "${OUT_TSV}"
+    fi
     sleep "${WATCH_SEC}"
   done
 else
   snapshot_once
-  render_dashboard "${OUT_TSV}"
+  if [[ "${MINIMAL_MODE}" == "1" ]]; then
+    render_minimal_dashboard "${OUT_TSV}"
+  else
+    render_dashboard "${OUT_TSV}"
+  fi
 fi

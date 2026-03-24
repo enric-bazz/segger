@@ -461,9 +461,9 @@ def generate_boundaries(
 
     def _compute_one(item: Tuple[object, np.ndarray]) -> Tuple[object, int, Union[Polygon, MultiPolygon, None]]:
         cid, points = item
-        n_points = points.shape[0]
-        if n_points < 3:
-            return cid, n_points, None
+        n_unique_points = np.unique(points, axis=0).shape[0]
+        if n_unique_points < 3:
+            return cid, n_unique_points, None
         try:
             bi = BoundaryIdentification(points)
             bi.calculate_part_1(plot=False)
@@ -471,7 +471,7 @@ def generate_boundaries(
             geom = bi.find_cycles()
         except Exception:
             geom = None
-        return cid, n_points, geom
+        return cid, n_unique_points, geom
 
     group_iter, total = iter_groups()
     res = []

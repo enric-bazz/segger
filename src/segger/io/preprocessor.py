@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from anndata import AnnData
 from typing import Literal, Optional
 from pathlib import Path
+import csv
 import geopandas as gpd
 import polars as pl
 import pandas as pd
@@ -28,6 +29,7 @@ from .fields import (
     CosMxTranscriptFields,
     CosMxBoundaryFields,
 )
+from .filtering import apply_feature_filters
 
 
 # Ignore pandas warnings in CosMX transcripts file
@@ -620,8 +622,7 @@ class CosMXPreprocessor(ISTPreprocessor):
             )
 
         # Filter technical controls when feature labels look CosMx-like.
-        feature_expr = pl.col(feature_col).cast(pl.String, strict=False)
-        lf = lf.filter(feature_expr.str.contains("|".join(raw.filter_substrings)).fill_null(False).not_())
+        lf = apply_feature_filters(lf, feature_col, raw.filter_substrings)
 
         assignment_expr = _clean_assignment_expr(assignment_col)
         if compartment_col is not None:
@@ -876,8 +877,7 @@ class XeniumPreprocessor(ISTPreprocessor):
         if self.min_qv is not None and self.min_qv > 0 and quality_col is not None:
             lf = lf.filter(pl.col(quality_col) >= self.min_qv)
 
-        feature_expr = pl.col(feature_col).cast(pl.String, strict=False)
-        lf = lf.filter(feature_expr.str.contains("|".join(raw.filter_substrings)).fill_null(False).not_())
+        lf = apply_feature_filters(lf, feature_col, raw.filter_substrings)
 
         assignment_expr = _clean_assignment_expr(assignment_col)
         assignment_expr = (
@@ -980,6 +980,9 @@ class XeniumPreprocessor(ISTPreprocessor):
         # 10X Xenium nucleus segmentation is intersection of geometries
         idx = cells.index.intersection(nuclei.index)
         if len(idx) > 0 and has_cell and has_nuc:
+            import shapely
+            cells.loc[idx, cells.geometry.name] = shapely.make_valid(cells.loc[idx].geometry)
+            nuclei.loc[idx, nuclei.geometry.name] = shapely.make_valid(nuclei.loc[idx].geometry)
             _ = cells.loc[idx].intersection(nuclei.loc[idx])
 
         if len(cells) == 0 and len(nuclei) > 0:
@@ -1159,6 +1162,31 @@ class MerscopePreprocessor(ISTPreprocessor):
     @staticmethod
     def _scan_transcripts_file(path: Path) -> pl.LazyFrame:
         if path.suffix.lower() == ".csv":
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                header = next(csv.reader(handle), [])
+
+            # Some MERSCOPE CSVs duplicate coordinate columns (e.g. `x`), which
+            # Polars rejects. Rename only the duplicates and preserve first copies.
+            seen: dict[str, int] = {}
+            normalized: list[str] = []
+            for idx, name in enumerate(header):
+                base = str(name)
+                if base == "":
+                    base = f"unnamed_{idx}"
+                dup_idx = seen.get(base, 0)
+                seen[base] = dup_idx + 1
+                normalized.append(base if dup_idx == 0 else f"{base}__dup{dup_idx}")
+
+            has_duplicate_names = len(set(header)) != len(header)
+            has_blank_names = any(str(name) == "" for name in header)
+            if has_duplicate_names or has_blank_names:
+                warnings.warn(
+                    f"MERSCOPE transcript CSV '{path.name}' has duplicate/blank column names; "
+                    "auto-renaming duplicate headers for robust parsing.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return pl.scan_csv(path, has_header=True, new_columns=normalized)
             return pl.scan_csv(path)
         if path.suffix.lower() == ".parquet":
             return pl.scan_parquet(path, parallel="row_groups")
@@ -1225,29 +1253,22 @@ class MerscopePreprocessor(ISTPreprocessor):
         quality_col = _first_existing(columns, [raw.quality, "qv"])
         if self.min_qv is not None and self.min_qv > 0 and quality_col is not None:
             lf = lf.filter(pl.col(quality_col) >= self.min_qv)
+        lf = apply_feature_filters(lf, feature_col, raw.filter_substrings)
 
-        rename_map = {
-            x_col: std.x,
-            y_col: std.y,
-            feature_col: std.feature,
-        }
-        select_cols = [std.row_index, std.x, std.y, std.feature, std.cell_id, std.compartment]
+        select_exprs: list[pl.Expr] = [
+            pl.col(std.row_index),
+            pl.col(x_col).alias(std.x),
+            pl.col(y_col).alias(std.y),
+            pl.col(feature_col).alias(std.feature),
+            cell_id_expr.alias(std.cell_id),
+            compartment_expr,
+        ]
 
-        lf = (
-            lf
-            .with_columns([
-                cell_id_expr.alias(std.cell_id),
-                compartment_expr,
-            ])
-            .rename(rename_map)
-            .with_row_index(name=std.row_index)
-        )
-
+        lf = lf.with_row_index(name=std.row_index)
         if self.include_z and z_col is not None:
-            lf = lf.rename({z_col: std.z})
-            select_cols.append(std.z)
+            select_exprs.append(pl.col(z_col).alias(std.z))
 
-        return lf.select(select_cols).collect()
+        return lf.select(select_exprs).collect()
 
     @staticmethod
     def _empty_boundaries() -> gpd.GeoDataFrame:

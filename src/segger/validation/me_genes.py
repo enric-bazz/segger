@@ -53,6 +53,48 @@ def _resolve_cell_type_column(
     )
 
 
+def _resolve_gene_name_column(
+    adata: ad.AnnData,
+    gene_name_column: Optional[str],
+) -> Optional[str]:
+    """Resolve gene-name source column with feature_name fallback."""
+    if gene_name_column is not None:
+        if gene_name_column in adata.var.columns:
+            return gene_name_column
+        warnings.warn(
+            f"Requested gene_name_column={gene_name_column!r} not found in reference var; "
+            "falling back to var_names.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+
+    if "feature_name" in adata.var.columns:
+        return "feature_name"
+    return None
+
+
+def _set_var_names_from_column(
+    adata: ad.AnnData,
+    column_name: str,
+) -> None:
+    """Promote var column values to var_names with safe fallbacks."""
+    original = [str(value) for value in adata.var_names]
+    values = adata.var[column_name].astype("string").fillna("")
+    promoted: list[str] = []
+    for fallback, raw in zip(original, values.astype(str).tolist()):
+        token = raw.strip()
+        if not token or token.lower() in {"nan", "none"}:
+            promoted.append(fallback)
+        else:
+            promoted.append(token)
+
+    if promoted != original:
+        adata.var_names = promoted
+    if not adata.var_names.is_unique:
+        adata.var_names_make_unique()
+
+
 def find_markers(
     adata: ad.AnnData,
     cell_type_column: str,
@@ -86,10 +128,37 @@ def find_markers(
 
     resolved_cell_type_column = _resolve_cell_type_column(adata, cell_type_column)
     markers = {}
-    sc.tl.rank_genes_groups(adata, groupby=resolved_cell_type_column)
+    group_counts = (
+        adata.obs[resolved_cell_type_column]
+        .value_counts(dropna=True)
+    )
+    rankable_groups = group_counts[group_counts >= 2].index
+    if len(rankable_groups) >= 2:
+        rankable_adata = adata[
+            adata.obs[resolved_cell_type_column].isin(rankable_groups)
+        ].copy()
+        try:
+            sc.tl.rank_genes_groups(rankable_adata, groupby=resolved_cell_type_column)
+        except ValueError as exc:
+            warnings.warn(
+                f"rank_genes_groups skipped due to invalid group statistics: {exc}",
+                RuntimeWarning,
+            )
+    elif len(group_counts) > 0:
+        skipped_groups = sorted(
+            str(group)
+            for group in group_counts[group_counts < 2].index
+        )
+        warnings.warn(
+            "rank_genes_groups skipped because fewer than two cell-type groups "
+            f"have >=2 cells. Singleton groups: {', '.join(skipped_groups)}",
+            RuntimeWarning,
+        )
+
     genes = adata.var_names
 
-    for cell_type in adata.obs[resolved_cell_type_column].unique():
+    cell_types = adata.obs[resolved_cell_type_column].dropna().unique()
+    for cell_type in cell_types:
         subset = adata[adata.obs[resolved_cell_type_column] == cell_type]
         mean_expression = np.asarray(subset.X.mean(axis=0)).flatten()
 
@@ -354,9 +423,10 @@ def load_me_genes_from_scrna(
         sc.pp.normalize_total(adata, target_sum=1e4)
         sc.pp.log1p(adata)
 
-    # Optionally remap gene names
-    if gene_name_column is not None and gene_name_column in adata.var.columns:
-        adata.var_names = adata.var[gene_name_column]
+    # Optionally remap gene names (defaults to feature_name when present).
+    resolved_gene_name_column = _resolve_gene_name_column(adata, gene_name_column)
+    if resolved_gene_name_column is not None:
+        _set_var_names_from_column(adata, resolved_gene_name_column)
 
     # Find markers
     with warnings.catch_warnings():
@@ -431,7 +501,7 @@ def me_gene_pairs_to_indices(
             index_pairs.append((gene_to_idx[gene1], gene_to_idx[gene2]))
 
     return index_pairs
-_ME_CACHE_VERSION = 3
+_ME_CACHE_VERSION = 4
 _ME_MAX_CELLS_PER_TYPE = 1000
 
 

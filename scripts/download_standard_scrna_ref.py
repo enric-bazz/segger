@@ -162,6 +162,34 @@ def immune_only_guess(cell_types: list[str]) -> bool:
     return has_immune
 
 
+def set_var_names_from_feature_column(
+    adata: ad.AnnData,
+    feature_column: str = "feature_name",
+) -> bool:
+    """Promote ``var[feature_column]`` into ``var_names`` when available."""
+    if feature_column not in adata.var.columns:
+        return False
+
+    original = [str(value) for value in adata.var_names]
+    feature_values = adata.var[feature_column].astype("string").fillna("")
+
+    promoted: list[str] = []
+    for fallback, raw in zip(original, feature_values.astype(str).tolist()):
+        token = raw.strip()
+        if not token or token.lower() in {"nan", "none"}:
+            promoted.append(fallback)
+        else:
+            promoted.append(token)
+
+    changed = promoted != original
+    if changed:
+        adata.var_names = promoted
+    if not adata.var_names.is_unique:
+        adata.var_names_make_unique()
+        changed = True
+    return changed
+
+
 def main() -> int:
     args = parse_args()
     out_dir = args.out_dir.resolve()
@@ -194,6 +222,7 @@ def main() -> int:
 
     normalized = adata.obs[selected_col].astype("string").fillna("Unknown")
     adata.obs["cell_type"] = normalized.astype("category")
+    set_var_names_from_feature_column(adata, feature_column="feature_name")
 
     cell_types = [str(item) for item in adata.obs["cell_type"].cat.categories.tolist()]
     warnings: list[str] = []

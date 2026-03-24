@@ -46,6 +46,9 @@ class MerscopeTranscriptFields:
     cell_boundary_id: str = 'cell_boundaries_id'
     nucleus_boundary_id: str = 'nucleus_boundaries_id'
     quality: str = 'score'
+    filter_substrings = [
+        'BLANK_*',
+    ]
 
 @dataclass
 class MerscopeBoundaryFields:

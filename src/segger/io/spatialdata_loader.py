@@ -15,6 +15,12 @@ import pandas as pd
 import polars as pl
 
 from segger.io.fields import StandardBoundaryFields, StandardTranscriptFields
+from segger.io.filtering import (
+    apply_feature_filters,
+    infer_platform_from_columns,
+    normalize_platform_name,
+    platform_feature_filter_patterns,
+)
 from segger.utils.optional_deps import (
     SPATIALDATA_IO_AVAILABLE,
     require_spatialdata,
@@ -122,6 +128,7 @@ class SpatialDataLoader:
         self._nucleus_shapes_key = nucleus_shapes_key
         self._coordinate_system = coordinate_system
         self._sdata = None
+        self._platform: Optional[str] = None
 
         if not self._path.exists():
             raise FileNotFoundError(f"SpatialData store not found: {self._path}")
@@ -142,6 +149,10 @@ class SpatialDataLoader:
         if self._points_key is None:
             self._points_key = self._detect_points_key()
         return self._points_key
+
+    @property
+    def platform(self) -> Optional[str]:
+        return self._platform
 
     @property
     def cell_shapes_key(self) -> Optional[str]:
@@ -231,11 +242,42 @@ class SpatialDataLoader:
 
         return df
 
+    def _detect_platform(self, columns: set[str]) -> Optional[str]:
+        if self._platform is not None:
+            return self._platform
+
+        attrs = getattr(self.sdata, "attrs", None)
+        if attrs is not None:
+            platform_attr = None
+            source_attr = None
+            if isinstance(attrs, dict):
+                platform_attr = attrs.get("platform")
+                source_attr = attrs.get("source")
+            else:
+                platform_attr = getattr(attrs, "get", lambda *_: None)("platform")
+                source_attr = getattr(attrs, "get", lambda *_: None)("source")
+
+            if platform_attr:
+                self._platform = normalize_platform_name(str(platform_attr))
+                return self._platform
+
+            if source_attr:
+                source_lower = str(source_attr).lower()
+                for candidate in ("xenium", "cosmx", "merscope"):
+                    if candidate in source_lower:
+                        self._platform = candidate
+                        return self._platform
+
+        self._platform = normalize_platform_name(infer_platform_from_columns(columns))
+        return self._platform
+
     def transcripts(
         self,
         normalize: bool = True,
         gene_column: Optional[str] = None,
         quality_column: Optional[str] = None,
+        min_qv: Optional[float] = None,
+        apply_platform_filters: bool = False,
     ) -> pl.LazyFrame:
         """Load transcripts from SpatialData and normalize to standard fields."""
         std = StandardTranscriptFields()
@@ -247,6 +289,7 @@ class SpatialDataLoader:
             return lf
 
         columns = set(df.columns)
+        detected_platform = self._detect_platform(columns)
 
         x_col = self._detect_column(columns, ["x", "x_location", "global_x", "x_global_px"])
         y_col = self._detect_column(columns, ["y", "y_location", "global_y", "y_global_px"])
@@ -271,7 +314,7 @@ class SpatialDataLoader:
 
         cell_id_col = self._detect_column(
             columns,
-            ["cell_id", "cell", "segger_cell_id", "segmentation_cell_id", "instance_id"],
+            ["cell_id", "cell", "segger_cell_id", "segmentation_cell_id", "instance_id", "cell_ID"],
             optional=True,
         )
 
@@ -295,6 +338,18 @@ class SpatialDataLoader:
             rename_map[quality_column] = quality_field
 
         lf = lf.rename({k: v for k, v in rename_map.items() if k != v})
+
+        if apply_platform_filters:
+            feature_patterns = platform_feature_filter_patterns(detected_platform)
+            if feature_patterns:
+                lf = apply_feature_filters(lf, std.feature, feature_patterns)
+
+        if min_qv is not None and min_qv > 0 and quality_column and quality_field:
+            schema_names = _lazyframe_column_names(lf)
+            if quality_field in schema_names:
+                lf = lf.filter(
+                    pl.col(quality_field).cast(pl.Float64, strict=False) >= float(min_qv)
+                )
 
         # Normalize/derive compartment labels for segmentation masking.
         if compartment_col:
@@ -450,6 +505,8 @@ def load_from_spatialdata(
     nucleus_shapes_key: Optional[str] = None,
     boundary_type: Literal["cell", "nucleus", "all"] = "all",
     normalize: bool = True,
+    min_qv: Optional[float] = None,
+    apply_platform_filters: bool = False,
 ) -> tuple[pl.LazyFrame, Optional[gpd.GeoDataFrame]]:
     """Convenience loader for SpatialData .zarr stores."""
     loader = SpatialDataLoader(
@@ -458,7 +515,11 @@ def load_from_spatialdata(
         cell_shapes_key=cell_shapes_key,
         nucleus_shapes_key=nucleus_shapes_key,
     )
-    tx = loader.transcripts(normalize=normalize)
+    tx = loader.transcripts(
+        normalize=normalize,
+        min_qv=min_qv,
+        apply_platform_filters=apply_platform_filters,
+    )
     bd = loader.boundaries(boundary_type=boundary_type)
     return tx, bd
 
