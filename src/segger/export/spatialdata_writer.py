@@ -36,16 +36,13 @@ import polars as pl
 from anndata import AnnData
 from scipy import sparse as sp
 
-
-from segger.utils.optional_deps import (
-    require_spatialdata,
-)
-if TYPE_CHECKING:
-    import geopandas as gpd
-    from spatialdata import SpatialData
+import spatialdata
+from spatialdata.models import PointsModel, ShapesModel, TableModel
+import dask.dataframe as dd
 
 
-# @register_writer(OutputFormat.SPATIALDATA)
+
+
 class SpatialDataWriter:
     """Write segmentation results as SpatialData Zarr store.
 
@@ -55,43 +52,35 @@ class SpatialDataWriter:
 
     Parameters
     ----------
-    include_boundaries
-        Whether to include cell shapes in output. Default True.
     boundary_method
         How to generate boundaries if not provided:
-        - "input": Use input boundaries if available
         - "convex_hull": Generate convex hull per cell
         - "delaunay": Delaunay triangulation-based boundary extraction
-        - "skip": Don't include shapes
     boundary_n_jobs
         Parallel workers for Delaunay boundary generation (threads).
     points_key
         Key for transcripts in sdata.points. Default "transcripts".
     shapes_key
-        Key for cell shapes in sdata.shapes. Default "cells".
+        Key for cell shapes in sdata.shapes. Default "cell_boundaries".
     include_table
         Whether to include AnnData table in sdata.tables. Default True.
     table_key
-        Key for AnnData table in sdata.tables. Default "cell_table".
+        Key for AnnData table in sdata.tables. Default "cells_table".
     table_region_key
         Column in shapes that identifies cells. Default "cell_id".
     """
 
     def __init__(
         self,
-        include_boundaries: bool = True,
-        boundary_method: Literal["input", "convex_hull", "delaunay", "skip"] = "convex_hull",
+        boundary_method: Literal["convex_hull", "delaunay"] = "convex_hull",
         boundary_n_jobs: int = 1,
         points_key: str = "transcripts",
-        shapes_key: str = "cells",
+        shapes_key: str = "cell_boundaries",
         include_table: bool = True,
         table_key: str = "cells_table",
-        fragment_table_key: str = "fragments_table",
         table_region_key: str = "cell_id",
     ):
-        require_spatialdata()
 
-        self.include_boundaries = include_boundaries
         self.boundary_method = boundary_method
         self.boundary_n_jobs = boundary_n_jobs
         self.points_key = points_key
@@ -108,7 +97,7 @@ class SpatialDataWriter:
         boundaries: Optional["gpd.GeoDataFrame"] = None,
         output_name: str = "segmentation.zarr",
         row_index_column: str = "row_index",
-        cell_id_column: str = "segger_cell_id",
+        cell_id_column: str = "cell_id",
         similarity_column: str = "segger_similarity",
         feature_column: str = "feature_name",
         x_column: str = "x",
@@ -249,9 +238,6 @@ class SpatialDataWriter:
         feature_column: str,
     ) -> "SpatialData":
         """Create SpatialData object from transcripts and boundaries."""
-        import spatialdata
-        from spatialdata.models import PointsModel, ShapesModel, TableModel
-        import dask.dataframe as dd
 
         identity = self._identity_transform()
         transformations = {"global": identity} if identity is not None else None
@@ -659,6 +645,12 @@ def build_anndata_table(
             adata.obs["region"] = region
         if region_key is not None:
             adata.obs["region_key"] = region_key
+
+        # add uns for openproblems 
+        uns={
+                'dataset_id': sdata.tables['table'].uns['dataset_id'],
+                'method_id': meta['name'],
+            }
         return adata
 
     feature_idx = (
