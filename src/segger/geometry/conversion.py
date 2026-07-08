@@ -143,7 +143,9 @@ def points_to_geoseries(
         if isinstance(data, cuspatial.GeoSeries):
             points.index = pd.Index(data.index.to_numpy())
     else:  # cuspatial
+        cp.cuda.Device(torch.cuda.current_device()).use()
         coords = cp.asarray(coords).ravel().astype('double')
+        print(torch.cuda.current_device(), coords.device)  # debugging
         points = cuspatial.GeoSeries.from_points_xy(coords)
         if isinstance(data, gpd.GeoSeries):
             points.index = cudf.Index(data.index)
