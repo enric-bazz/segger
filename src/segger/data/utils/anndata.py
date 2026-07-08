@@ -9,6 +9,7 @@ import sklearn
 import torch
 import cupyx
 import cuml
+import warnings
 
 from ...io.fields import TrainingTranscriptFields, TrainingBoundaryFields
 from .neighbors import phenograph_rapids
@@ -220,7 +221,9 @@ def setup_anndata(
     # Build gene embedding on filtered dataset
     C = np.corrcoef(ad[ad.obs['filtered']].layers['norm'].todense().T)
     C = np.nan_to_num(C, 0, posinf=True, neginf=True)
-    model = sklearn.decomposition.PCA(n_components=cells_embedding_size)
+    model = sklearn.decomposition.PCA(n_components=min(cells_embedding_size, ad.var.shape[0]))
+    if ad.var.shape[0] < cells_embedding_size:
+        warnings.warn('cell embedding size is larger than input feature space, falling back to that size.')
     ad.varm['X_corr'] = model.fit_transform(C)
 
     # Build PCs on filtered cells and project all cells
