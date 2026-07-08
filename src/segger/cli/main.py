@@ -666,8 +666,6 @@ def segment(
     )
     torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/prediction_snapshot.pickle")
 
-    # torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/my_snapshot.pickle")
-
 
 @app.command
 def predict(
