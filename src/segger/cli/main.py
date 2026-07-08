@@ -640,7 +640,6 @@ def segment(
         max_epochs=n_epochs,
         reload_dataloaders_every_n_epochs=1,
         callbacks=[checkpoint_callback, writer],
-        devices=1,  # force single GPU to avoid torch.ditributed issues
     )
 
     # Training
@@ -792,7 +791,6 @@ def predict(
         logger=False,
         callbacks=[writer],
         log_every_n_steps=1,
-        devices=1,  # force single GPU to avoid torch.ditributed issues
     )
     trainer.predict(
         model=model,
