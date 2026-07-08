@@ -4,6 +4,11 @@ from typing import Annotated, Literal
 from pathlib import Path
 
 from .registry import ParameterRegistry
+import cuda.bindings.driver as cuda
+cuda.cuInit(0)
+_, dev = cuda.cuDeviceGet(0)
+_, ctx = cuda.cuCtxCreate(0, dev)
+cuda.cuCtxSetCurrent(ctx)
 
 
 # Register defaults and descriptions from files directly
