@@ -25,6 +25,23 @@ def get_quadtree_kwargs(
         A dictionary of keyword arguments including x_min, x_max, y_min,
         y_max, scale, and max_depth.
     """
+    # Inspect points array
+    print(points)
+    print(type(points))
+    points.head()
+    points.dtypes
+    len(points)
+    print(points.points.x)
+    print(points.__cuda_array_interface__)
+    assert not points.points.x.isnull().any()
+    assert not points.points.y.isnull().any()
+    x = np.asarray(points.points.x.to_numpy(), dtype=np.float32)
+    y = np.asarray(points.points.y.to_numpy(), dtype=np.float32)
+    print("numpy conversionpassed")
+
+    print(x.min(), x.max())
+    print(y.min(), y.max())
+
     # Calculate bounds
     x_min = float(points.points.x.min())
     x_max = float(points.points.x.max())
