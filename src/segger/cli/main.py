@@ -522,6 +522,7 @@ def segment(
     ] = "false",
 ):
     """Run cell segmentation on spatial transcriptomics data."""
+    print("Entering segmentation...")
     if min_fragment_size is not None:
         if (
             fragment_min_transcripts != 5
@@ -557,12 +558,14 @@ def segment(
     # Remove SLURM environment autodetect
     from lightning.pytorch.plugins.environments import SLURMEnvironment
     SLURMEnvironment.detect = lambda: False
+    print("Data successfully loaded")
 
     import torch
     torch.cuda.memory._record_memory_history()
 
     # Setup Lightning Data Module
     from ..data import ISTDataModule
+    print("Creating datamodule...")
     datamodule = ISTDataModule(
         input_directory=input_directory,
         cells_representation_mode=cells_representation,
@@ -588,10 +591,12 @@ def segment(
         scrna_reference_path=scrna_reference_path,
         scrna_celltype_column=scrna_celltype_column,
     )
+    print("Done.")
     
     # Setup Lightning Model
     from ..models import LitISTEncoder
     n_genes = datamodule.ad.shape[1]
+    print("Creating model...")
     model = LitISTEncoder(
         n_genes=n_genes,
         n_mid_layers=n_mid_layers,
@@ -615,7 +620,7 @@ def segment(
         normalize_embeddings=normalize_embeddings,
         use_positional_embeddings=use_positional_embeddings,
     )
-
+    print("Done.")
     # Setup Lightning Trainer
     from lightning.pytorch.loggers import CSVLogger
     from lightning.pytorch.callbacks import ModelCheckpoint
@@ -646,17 +651,22 @@ def segment(
     )
 
     # Training
+    print("Starting training...")
     trainer.fit(model=model, datamodule=datamodule)
+    print("Training completed.")
 
     torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/training_snapshot.pickle")
 
     # Prediction: use in-memory model directly to avoid checkpoint reload.
+    print("Starting prediction...")
     trainer.predict(
         model=model,
         datamodule=datamodule,
         return_predictions=False,
     )
     torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/prediction_snapshot.pickle")
+
+    # torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/my_snapshot.pickle")
 
 
 @app.command

@@ -434,6 +434,7 @@ class ISTDataModule(LightningDataModule):
             genes_clusters_resolution=self.genes_clusters_resolution,
             compute_morphology=(self.cells_representation_mode == "morphology"),
         )
+        print("Setting up heterodata...")
         self.data = setup_heterodata(
             transcripts=tx,
             boundaries=bd,
@@ -452,16 +453,19 @@ class ISTDataModule(LightningDataModule):
             use_3d=self.use_3d,
             me_gene_pairs=self.me_gene_pairs,
         )
+        print("Done.")
         # Tile graph dataset
         node_positions = torch.vstack([
             self.data['tx']['pos'],
             self.data['bd']['pos'],
         ])
         if self.tiling_mode == "adaptive":
+            print("Tiling...")
             self.tiling = QuadTreeTiling(
                 positions=node_positions,
                 max_tile_size=self.tiling_nodes_per_tile,
             )
+            print("Done.")
         #TODO: Remove (benchmarking only)
         elif self.tiling_mode == "square":
             self.tiling = SquareTiling(
@@ -569,6 +573,7 @@ class ISTDataModule(LightningDataModule):
 
         # Tile dataset (outer margin) for prediction
         if stage == "predict":
+            print("Moving heterograph to CUDA for prediction...")
             self.data = self.data.cuda()
             self.predict_dataset = _build_predict_dataset_with_fallback()
         return super().setup(stage)
