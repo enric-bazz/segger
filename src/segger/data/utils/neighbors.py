@@ -49,7 +49,13 @@ def phenograph_rapids(
     result['partition'] = result['partition'].map(sizes)
     
     # Sort by vertex (e.g. cell)
-    return result.sort_values('vertex')['partition'].values.get()
+    df = result.sort_values('vertex')
+    col = df['partition']
+    print(type(col))
+    print(col.__cuda_array_interface__)
+    vals = col.to_arrow().to_numpy()
+
+    return vals
 
 
 def knn_to_edge_index(
