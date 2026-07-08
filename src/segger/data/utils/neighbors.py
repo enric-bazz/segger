@@ -4,6 +4,13 @@ from typing import Any, Literal
 import geopandas as gpd
 import polars as pl
 import numpy as np
+import sys
+import types
+
+# Create a fake UCX module
+sys.modules["ucp"] = types.ModuleType("ucp")
+sys.modules["ucxx"] = types.ModuleType("ucxx")
+sys.modules["ucx"] = types.ModuleType("ucx")
 import cupy as cp
 import cugraph
 import torch
