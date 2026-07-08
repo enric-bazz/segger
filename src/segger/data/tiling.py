@@ -198,6 +198,17 @@ class QuadTreeTiling(Tiling):
         max_tile_size: int,
     ):
         # Calculate QuadTree on points and set as tiles
+        from pynvml import (
+        nvmlInit, nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetMemoryInfo
+        )
+
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(0)
+
+        info = nvmlDeviceGetMemoryInfo(handle)
+        print(info.used / 1024**2, "MB used")
+        print(info.free / 1024**2, "MB free")
         points = points_to_geoseries(positions, backend='cuspatial')
         _, quadtree = get_quadtree_index(
             points,

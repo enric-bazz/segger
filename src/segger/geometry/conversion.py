@@ -143,10 +143,27 @@ def points_to_geoseries(
         if isinstance(data, cuspatial.GeoSeries):
             points.index = pd.Index(data.index.to_numpy())
     else:  # cuspatial
+        import rmm
+        print("before: ", rmm.mr.get_current_device_resource())
+                # Calculate QuadTree on points and set as tiles
+        from pynvml import (
+        nvmlInit, nvmlDeviceGetHandleByIndex,
+        nvmlDeviceGetMemoryInfo
+        )
+
+        nvmlInit()
+        handle = nvmlDeviceGetHandleByIndex(0)
+
+        info = nvmlDeviceGetMemoryInfo(handle)
+        print(info.used / 1024**2, "MB used")
+        print(info.free / 1024**2, "MB free")
         coords = cp.asarray(coords).ravel().astype('double')
         points = cuspatial.GeoSeries.from_points_xy(coords)
         if isinstance(data, gpd.GeoSeries):
             points.index = cudf.Index(data.index)
+        print("after: ", rmm.mr.get_current_device_resource())
+        print(info.used / 1024**2, "MB used")
+        print(info.free / 1024**2, "MB free")
     return points
 
 

@@ -558,6 +558,9 @@ def segment(
     from lightning.pytorch.plugins.environments import SLURMEnvironment
     SLURMEnvironment.detect = lambda: False
 
+    import torch
+    torch.cuda.memory._record_memory_history()
+
     # Setup Lightning Data Module
     from ..data import ISTDataModule
     datamodule = ISTDataModule(
@@ -645,12 +648,15 @@ def segment(
     # Training
     trainer.fit(model=model, datamodule=datamodule)
 
+    torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/training_snapshot.pickle")
+
     # Prediction: use in-memory model directly to avoid checkpoint reload.
     trainer.predict(
         model=model,
         datamodule=datamodule,
         return_predictions=False,
     )
+    torch.cuda.memory._dump_snapshot("/data/e422o/segmentation-exploration/prediction_snapshot.pickle")
 
 
 @app.command
