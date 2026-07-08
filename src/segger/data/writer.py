@@ -347,7 +347,11 @@ class ISTSegmentationWriter(BasePredictionWriter):
 
         # Map local tx node indices to transcript row indices so edge IDs are in
         # the same ID space as segmentation_df[tx_fields.row_index].
-        device = edge_index.device
+
+        # Move to CPU
+        edge_index = edge_index.to('cpu')
+        device = torch.device("cpu")
+
         tx_index = base_data['tx']['index']
         if tx_index.device != device:
             tx_index = tx_index.to(device)
@@ -540,7 +544,7 @@ class ISTSegmentationWriter(BasePredictionWriter):
             source_ids=filtered_src_ids,
             target_ids=filtered_dst_ids,
             min_transcripts=self.fragment_min_transcripts,
-            use_gpu=use_gpu,
+            use_gpu=False,
         )
         if fragment_tx_ids.size == 0:
             if debug_fragment:

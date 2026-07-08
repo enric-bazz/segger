@@ -45,7 +45,7 @@ def compute_fragment_assignments(
     source_ids: Any,
     target_ids: Any,
     min_transcripts: int = 5,
-    use_gpu: bool = True,
+    use_gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute transcript->component assignments for already filtered edges.
 
@@ -130,7 +130,7 @@ def compute_fragment_components(
     target_ids: np.ndarray,
     similarities: np.ndarray,
     similarity_threshold: float = 0.5,
-    use_gpu: bool = True,
+    use_gpu: bool = False,
 ) -> dict[int, int]:
     """Compute connected components from transcript-transcript edges.
 
@@ -198,7 +198,7 @@ def apply_fragment_mode(
     tx_tx_edges: pl.DataFrame,
     min_transcripts: int = 5,
     similarity_threshold: float = 0.5,
-    use_gpu: bool = True,
+    use_gpu: bool = False,
     cell_id_column: str = "segger_cell_id",
     transcript_id_column: str = "transcript_id",
     similarity_column: str = "similarity",
@@ -271,7 +271,7 @@ def apply_fragment_mode(
         target_ids=target_ids,
         similarities=similarities,
         similarity_threshold=similarity_threshold,
-        use_gpu=use_gpu,
+        use_gpu=False,  # use_gpu for available memory-based behaviour
     )
 
     if not component_labels:
