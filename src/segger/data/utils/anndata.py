@@ -5,6 +5,7 @@ import polars as pl
 import pandas as pd
 import scanpy as sc
 import numpy as np
+import math
 import sklearn
 import torch
 import cupyx
@@ -216,14 +217,22 @@ def setup_anndata(
     # Build gene embedding on filtered dataset
     C = np.corrcoef(ad[ad.obs['filtered']].layers['norm'].todense().T)
     C = np.nan_to_num(C, 0, posinf=True, neginf=True)
-    model = sklearn.decomposition.PCA(n_components=min(cells_embedding_size, ad.var.shape[0]))
-    if ad.var.shape[0] < cells_embedding_size:
-        warnings.warn('cell embedding size is larger than input feature space, falling back to that size.')
-    ad.varm['X_corr'] = model.fit_transform(C)
+
+    # Set number of components to the minimum of the embedding size and the largest power of 2 <= the number of genes
+    n_components = cells_embedding_size
+
+    if ad.n_vars < cells_embedding_size:
+        warnings.warn(
+            "Cell embedding size is larger than input feature space, falling back to the largest power of 2 below that."
+        )
+        n_components = 2 ** int(math.log2(ad.n_vars))
+
+    model = sklearn.decomposition.PCA(n_components=n_components)
+    ad.varm["X_corr"] = model.fit_transform(C)
 
     # Build PCs on filtered cells and project all cells
     counts_sparse_gpu = cupyx.scipy.sparse.csr_matrix(ad.layers['norm'])
-    model = cuml.PCA(n_components=cells_embedding_size)
+    model = cuml.PCA(n_components=n_components)
     model.fit(counts_sparse_gpu[ad.obs['filtered'].values])
     ad.obsm['X_pca'] = model.transform(counts_sparse_gpu).get()
 
